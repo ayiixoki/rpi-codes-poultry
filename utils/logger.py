@@ -1,0 +1,62 @@
+import time
+from firebase_service import write_log
+
+_last_log = {}
+
+# Prevent duplicate logs within 5 minutes
+DUPLICATE_INTERVAL = 300
+
+
+def _write(log_type, title, message):
+    now = time.time()
+
+    key = f"{log_type}:{title}:{message}"
+
+    if key in _last_log:
+        if now - _last_log[key] < DUPLICATE_INTERVAL:
+            return
+
+    _last_log[key] = now
+
+    entry = {
+        "type": log_type,
+        "title": title,
+        "message": message,
+        "timestamp": int(now * 1000),
+        "is_read": False,
+    }
+
+    write_log(entry)
+
+
+def log_system(message):
+    _write("info", "System", message)
+
+
+def log_feed(amount, triggered_by):
+    _write(
+        "feeding",
+        "Feed Dispensed",
+        f"{amount} g ({triggered_by})",
+    )
+
+
+def log_water(triggered_by):
+    _write(
+        "water",
+        "Water Dispensed",
+        triggered_by,
+    )
+
+
+def log_actuator(device, state, temperature=None):
+    if temperature is None:
+        msg = state
+    else:
+        msg = f"{state} ({temperature:.1f}°C)"
+
+    _write("climate", device, msg)
+
+
+def log_alert(title, message):
+    _write("alert", title, message)

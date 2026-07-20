@@ -1,0 +1,94 @@
+import tkinter as tk
+from tkinter import font as tkfont
+import json
+import os
+
+# -- Config -------------------------------------------------------------
+SHARED_STATE_FILE = "shared_state.json"
+LCD_COMMANDS_FILE = "lcd_commands.json"
+POLL_MS = 1000  # how often the dashboard refreshes from shared_state.json
+
+# Colors (simple, high-contrast for a small touchscreen)
+BG_DARK = "#1e2328"
+BG_CARD = "#2a3038"
+BG_CARD_ALT = "#323a44"
+ACCENT_GREEN = "#4caf7d"
+ACCENT_RED = "#e5605a"
+ACCENT_BLUE = "#4a90d9"
+ACCENT_AMBER = "#e0a63a"
+TEXT_MAIN = "#f2f2f2"
+TEXT_DIM = "#9aa4ae"
+
+# Badge colors (Low / Normal / High) - mirrors the mobile app's status pills
+BADGE_LOW = ("#4a4326", "#e0c568")     # dark amber bg, amber text
+BADGE_NORMAL = ("#25402f", "#7fd9a8")  # dark green bg, green text
+BADGE_HIGH = ("#4a2a29", "#e5807c")    # dark red bg, red text
+
+# Actuator card colors
+ACTUATOR_ON_BG = "#3a3320"
+ACTUATOR_OFF_BG = BG_CARD_ALT
+
+
+class PoultryDashboard(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("PoultryCare Dashboard")
+
+        self.geometry("800x480")
+        self.attributes("-fullscreen", True)
+        self.configure(bg=BG_DARK)
+        self.bind("<Escape>", lambda e: self.attributes("-fullscreen", False))
+
+        self.font_big = tkfont.Font(family="DejaVu Sans", size=30, weight="bold")
+        self.font_med = tkfont.Font(family="DejaVu Sans", size=18, weight="bold")
+        self.font_small = tkfont.Font(family="DejaVu Sans", size=13, weight="bold")
+        self.font_badge = tkfont.Font(family="DejaVu Sans", size=12, weight="bold")
+        self.font_button = tkfont.Font(family="DejaVu Sans", size=16, weight="bold")
+
+        self._build_layout()
+        self._poll_state()
+
+    def _build_layout(self):
+        self.status_bar = tk.Frame(self, bg=BG_CARD, height=40)
+        self.status_bar.pack(fill="x", side="top")
+        self.status_bar.pack_propagate(False)
+
+        self.online_label = tk.Label(
+            self.status_bar, text="? OFFLINE", font=self.font_small,
+            bg=BG_CARD, fg=ACCENT_RED
+        )
+        self.online_label.pack(side="left", padx=15)
+
+        self.time_label = tk.Label(
+            self.status_bar, text="", font=self.font_small, bg=BG_CARD, fg=TEXT_DIM
+        )
+        self.time_label.pack(side="right", padx=15)
+
+        title = tk.Label(
+            self.status_bar, text="PoultryCare", font=self.font_med,
+            bg=BG_CARD, fg=TEXT_MAIN
+        )
+        title.pack(side="left", padx=5)
+
+        content = tk.Frame(self, bg=BG_DARK)
+        content.pack(fill="both", expand=True, padx=10, pady=10)
+
+        left = tk.Frame(content, bg=BG_DARK, width=380)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        left.pack_propagate(False)
+
+        right = tk.Frame(content, bg=BG_DARK, width=380)
+        right.pack(side="right", fill="both", expand=True, padx=(8, 0))
+        right.pack_propagate(False)
+
+        # -- Sensor cards (2x2 grid), each with a value + status badge -----
+        # Fixed height (not auto-sized) so this section can never push the
+        # actuator/schedule sections below it off the 480px-tall screen.
+        sensor_grid = tk.Frame(left, bg=BG_DARK, height=220)
+        sensor_grid.pack(fill="x", pady=(0, 6))
+        sensor_grid.pack_propagate(False)
+        sensor_grid.grid_columnconfigure(0, weight=1)
+        sensor_grid.grid_columnconfigure(1, weight=1)
+        sensor_grid.grid_rowconfigure(0, weight=1)
+        sensor_grid.grid_rowconfigure(1, weight=1)
+
