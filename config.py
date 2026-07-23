@@ -30,9 +30,12 @@ SLOW_READ_INTERVAL = 5     # seconds - temperature + humidity (DHT22)
 DEFAULT_FEED_LOW = 100
 
 # Hysteresis (prevents relay chattering)
-TEMP_HYSTERESIS = 1.0      # degrees
-HUM_HYSTERESIS = 5.0       # %
+TEMP_HYSTERESIS = 0.1     # degrees
+HUM_HYSTERESIS = 1.0       # %
 
 DISPENSE_OVERSHOOT_BUFFER_GRAMS = 2  # stop this many grams early to account for feed still falling after servo closes
 
 WATER_EXTRA_FILL_TIME = 1.0 #seconds to keep the water pump running after the water level sensor reads "normal" to ensure the water is topped up
+
+EXHAUST_MIN_RUN_SECONDS = 180      # fan must run at least this long once it starts
+HUM_CRITICAL_BUFFER = 10           # humidity this far above humMax overrides heat need

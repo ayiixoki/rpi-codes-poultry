@@ -49,11 +49,11 @@ def log_water(triggered_by):
     )
 
 
-def log_actuator(device, state, temperature=None):
-    if temperature is None:
+def log_actuator(device, state, reason=None):
+    if reason is None:
         msg = state
     else:
-        msg = f"{state} ({temperature:.1f}°C)"
+        msg = f"{state} ({reason})"
 
     _write("climate", device, msg)
 

@@ -40,6 +40,8 @@ last_checked_minute = None
 feed_low_active = False
 water_low_active = False     
 
+exhaust_fan_last_on_time = None
+
 #  Threshold Logic 
 def get_active_thresholds():
     # Try Firebase (live, most up-to-date)
@@ -107,6 +109,22 @@ def control_environment(temperature, humidity, thresholds):
             or (humidity is not None and humidity > hum_max)
         )
 
+    hum_critical = hum_max + config.HUM_CRITICAL_BUFFER
+    humidity_critical = humidity is not None and humidity >= hum_critical
+
+    if need_heat and not (temperature > temp_max) and not humidity_critical:
+        # Suppress exhaust for ordinary high humidity while heating —
+        # but let genuinely critical humidity override, since prolonged
+        # high humidity is a health risk regardless of temperature.
+        need_exhaust = False
+
+    # Don't let the fan shut off again the instant temp dips —
+    # give it a minimum run time to actually vent moisture out.
+    if exhaust_fan_on and not need_exhaust:
+        elapsed = time.time() - (exhaust_fan_last_on_time or 0)
+        if elapsed < config.EXHAUST_MIN_RUN_SECONDS:
+            need_exhaust = True
+
     # =========================================
     # Heating Lamp
     # =========================================
@@ -157,6 +175,7 @@ def control_environment(temperature, humidity, thresholds):
 
         turn_on_exhaust_fan()
         exhaust_fan_on = True
+        exhaust_fan_last_on_time = time.time()
 
         update_actuator_state("exhaustFan", True)
 
