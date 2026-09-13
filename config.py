@@ -22,12 +22,14 @@ GRAMS_PER_SECOND = 5
 DEFAULT_MANUAL_DISPENSE_GRAMS = 200
 MANUAL_COMMAND_POLL_INTERVAL = 0.1
 
+FEED_CAPACITY_GRAMS = 500 
+
 # Sensor read interval (seconds)
-FAST_READ_INTERVAL = 1     # seconds - feed weight + water level
-SLOW_READ_INTERVAL = 5     # seconds - temperature + humidity (DHT22)
+FAST_READ_INTERVAL = 1    # seconds - feed weight + water level
+SLOW_READ_INTERVAL = 10     # seconds - temperature + humidity (DHT22)
 
 # Feed low threshold default
-DEFAULT_FEED_LOW = 100
+DEFAULT_FEED_LOW = 20
 
 # Hysteresis (prevents relay chattering)
 TEMP_HYSTERESIS = 0.1     # degrees

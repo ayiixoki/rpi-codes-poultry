@@ -9,7 +9,7 @@ from firebase_service import (
     get_schedules, update_actuator_state, write_log, send_alert_push
 )
 from sensors.dht22 import read_dht22
-from sensors.load_cell import setup_hx711, read_grams
+from sensors.load_cell import setup_hx711, read_grams, update_stable_grams, reset_stable_grams
 from sensors.float_sensor import setup_float_sensor, read_water_level
 from actuators.relay_control import (
     setup_relay, turn_on_heating_lamp, turn_off_heating_lamp,
@@ -31,8 +31,17 @@ heating_lamp_on = False
 exhaust_fan_on = False
 is_dispensing = False  # NEW: master lock so feed+water never overlap
 
+latest_feed_weight = None
+latest_water_level = None
+
 SCHEDULE_CACHE_FILE = "schedule_cache.json"
 THRESHOLD_CACHE_FILE = "threshold_cache.json"
+
+THRESHOLD_REFRESH_INTERVAL = 30  # seconds
+threshold_refresh_loops = THRESHOLD_REFRESH_INTERVAL // config.FAST_READ_INTERVAL
+
+cached_thresholds = None
+cached_schedules = None
 
 fired_schedules_this_minute = set()
 last_checked_minute = None
@@ -48,6 +57,12 @@ def get_active_thresholds():
     try:
         thresholds = get_thresholds()
         if thresholds:
+            # Normalize feedLow / feedlow key mismatch from the app -
+            # always prefer the lowercase key since that's what the
+            # Settings screen currently writes to.
+            if "feedlow" in thresholds:
+                thresholds["feedLow"] = thresholds["feedlow"]
+
             try:
                 with open(THRESHOLD_CACHE_FILE, "w") as f:
                     json.dump(thresholds, f)
@@ -78,7 +93,7 @@ def get_active_thresholds():
 
 #  Environmental Control 
 def control_environment(temperature, humidity, thresholds):
-    global heating_lamp_on, exhaust_fan_on
+    global heating_lamp_on, exhaust_fan_on, exhaust_fan_last_on_time
 
     if temperature is None:
         return
@@ -146,7 +161,7 @@ def control_environment(temperature, humidity, thresholds):
             f"Temperature dropped to {temperature:.1f}°C (below {temp_min}°C)"
         )
 
-        print(f"🔥 Heating Lamp ON ({temperature:.1f}°C)")
+        print(f" Heating Lamp ON ({temperature:.1f}°C)")
 
     elif not need_heat and heating_lamp_on:
 
@@ -165,7 +180,7 @@ def control_environment(temperature, humidity, thresholds):
             f"Temperature recovered to {temperature:.1f}°C"
         )
 
-        print(f"🟢 Heating Lamp OFF ({temperature:.1f}°C)")
+        print(f" Heating Lamp OFF ({temperature:.1f}°C)")
 
     # =========================================
     # Exhaust Fan
@@ -214,7 +229,7 @@ def control_environment(temperature, humidity, thresholds):
             f"Environment returned to normal ({temperature:.1f}°C)"
         )
 
-        print(f"🟢 Cooling Fan OFF ({temperature:.1f}°C)")
+        print(f" Cooling Fan OFF ({temperature:.1f}°C)")
 
 #  Feed Dispensing 
 def dispense_feed(target_grams, triggered_by="schedule"):
@@ -222,7 +237,7 @@ def dispense_feed(target_grams, triggered_by="schedule"):
     if is_dispensing_feed:
         return
 
-    current_weight = read_grams()
+    current_weight = latest_feed_weight if latest_feed_weight is not None else read_grams()
     if current_weight is not None and current_weight >= target_grams:
         print(f"Feed already at {current_weight}g (target {target_grams}g) - skipping, no dispense needed")
         return
@@ -244,6 +259,7 @@ def dispense_feed(target_grams, triggered_by="schedule"):
         close_feed()
         update_actuator_state("feedServo", False)
         final_weight = read_grams()
+        reset_stable_grams(final_weight)
         log_feed(final_weight, triggered_by)
 
         try:
@@ -266,7 +282,7 @@ def dispense_water(triggered_by="schedule"):
     if is_dispensing_water:
         return
 
-    current_level = read_water_level()
+    current_level = latest_water_level if latest_water_level is not None else read_water_level()
     if current_level in ("normal", "full"):
         print(f"Water already '{current_level}' - skipping, no dispense needed")
         return
@@ -470,8 +486,8 @@ def check_manual_commands():
         try:
             manual_grams = data.get('manual_dispense_grams', config.DEFAULT_MANUAL_DISPENSE_GRAMS)
             ref.update({'feeder_active': False, 'manual_dispense_grams': 0})
-            current = read_grams() or 0
-            target = current + manual_grams  # ADD grams on top of current level
+            current = latest_feed_weight if latest_feed_weight is not None else 0
+            target = current + manual_grams
             print(f"Manual feed: current {current}g + {manual_grams}g -> target {target}g")
         except Exception as e:
             print(f"Manual feed trigger error: {e}")
@@ -507,7 +523,7 @@ def check_lcd_commands():
     if feed_triggered:
         try:
             manual_grams = data.get("feed_dispense", {}).get("grams", config.DEFAULT_MANUAL_DISPENSE_GRAMS)
-            current = read_grams() or 0
+            current = latest_feed_weight if latest_feed_weight is not None else 0
             target = current + manual_grams
             print(f"LCD manual feed: current {current}g + {manual_grams}g -> target {target}g")
         except Exception as e:
@@ -531,6 +547,7 @@ def check_lcd_commands():
         ).start()
  
 #  Manual Command Watcher (fast, independent of the sensor loop) 
+#  Manual Command Watcher (Firebase-based, fast, independent of the sensor loop) 
 def manual_command_watcher():
     poll_interval = getattr(config, 'MANUAL_COMMAND_POLL_INTERVAL', 0.5)
     while True:
@@ -538,6 +555,12 @@ def manual_command_watcher():
             check_manual_commands()
         except Exception as e:
             print(f"Manual command watcher error: {e}")
+        time.sleep(poll_interval)
+
+#  LCD Command Watcher (local file, independent of Firebase latency) 
+def lcd_command_watcher():
+    poll_interval = getattr(config, 'LCD_COMMAND_POLL_INTERVAL', 0.2)
+    while True:
         try:
             check_lcd_commands()
         except Exception as e:
@@ -548,18 +571,19 @@ def manual_command_watcher():
 def check_alerts(feed_weight, water_level, thresholds):
     global feed_low_active, water_low_active
 
-    feed_low_threshold = thresholds.get("feedLow", 100)
+    feed_low_threshold = thresholds.get("feedLow", 20)   # now a PERCENT, default fixed too
 
     # -------------------------
     # Feed Level
     # -------------------------
     if feed_weight is not None:
+        feed_percent = (feed_weight / config.FEED_CAPACITY_GRAMS) * 100   # <-- NEW LINE (step 5)
 
         # Feed became LOW
-        if feed_weight < feed_low_threshold and not feed_low_active:
+        if feed_percent < feed_low_threshold and not feed_low_active:     # <-- was feed_weight
             feed_low_active = True
 
-            log_alert("Low Feed", f"{feed_weight:.0f} g remaining")
+            log_alert("Low Feed", f"{feed_weight:.0f} g remaining ({feed_percent:.0f}%)")
 
             db.reference("/notifications").push({
                 "type": "lowFeed",
@@ -569,19 +593,20 @@ def check_alerts(feed_weight, water_level, thresholds):
 
             send_alert_push(
                 "Low Feed Alert",
-                f"Feed level is low ({feed_weight:.0f} g remaining)"
+                f"Feed level is low ({feed_percent:.0f}% remaining)"
             )
 
-            print(f"⚠ Low Feed: {feed_weight:.0f} g")
+            print(f"Low Feed: {feed_weight:.0f} g ({feed_percent:.0f}%)")
 
         # Feed restored
-        elif feed_weight >= feed_low_threshold and feed_low_active:
+        elif feed_percent >= feed_low_threshold and feed_low_active:      # <-- was feed_weight
             feed_low_active = False
 
-            log_alert("Feed Restocked", f"{feed_weight:.0f} g available")
+            log_alert("Feed Restocked", f"{feed_weight:.0f} g available ({feed_percent:.0f}%)")
 
-            print(f"✅ Feed Restocked: {feed_weight:.0f} g")
+            print(f"Feed Restocked: {feed_weight:.0f} g ({feed_percent:.0f}%)")
 
+    # (water level section stays exactly the same, unchanged below this)
     # -------------------------
     # Water Level
     # -------------------------
@@ -603,7 +628,7 @@ def check_alerts(feed_weight, water_level, thresholds):
             "Water level is low."
         )
 
-        print("⚠ Low Water")
+        print("Low Water")
 
     # Water restored
     elif not current_low and water_low_active:
@@ -611,18 +636,21 @@ def check_alerts(feed_weight, water_level, thresholds):
 
         log_alert("Water Restored", "Water level normal")
 
-        print("✅ Water Restored")
+        print(" Water Restored")
 
 # Shared State Writer (for LCD dashboard) 
 SHARED_STATE_FILE = "shared_state.json"        
 
 def write_shared_state(temperature, humidity, feed_weight, water_level, thresholds, next_schedule=None, system_online=True):
+    feed_percent = (feed_weight / config.FEED_CAPACITY_GRAMS * 100) if feed_weight is not None else None
+    
     state = {
         "temperature": temperature,
         "humidity": humidity,
         "feed_weight": feed_weight,
+        "feed_percent": feed_percent,
         "water_level": water_level,
-        "feed_low_threshold": thresholds.get("feedLow", 100),
+        "feed_low_threshold": thresholds.get("feedLow", 20),
         "temp_min_threshold": thresholds.get("tempMin", config.DEFAULT_TEMP_MIN),
         "temp_max_threshold": thresholds.get("tempMax", config.DEFAULT_TEMP_MAX),
         "hum_min_threshold": thresholds.get("humMin", config.DEFAULT_HUM_MIN),
@@ -644,6 +672,7 @@ def write_shared_state(temperature, humidity, feed_weight, water_level, threshol
 # Main Loop 
 def main():
     print("Initializing PoultryCare system...")
+    global cached_thresholds, cached_schedules
     init_firebase()
     setup_relay()
     setup_hx711()
@@ -652,6 +681,7 @@ def main():
     print("All systems initialized. Starting main loop...")
     
     threading.Thread(target=manual_command_watcher, daemon=True).start()
+    threading.Thread(target=lcd_command_watcher, daemon=True).start()
 
     loop_count = 0
     LOG_INTERVAL = 3600    # seconds
@@ -669,8 +699,14 @@ def main():
         while True:
 
             # Fast sensors: read every loop 
-            feed_weight = read_grams()
+            instant_grams = read_grams()
+            feed_weight = update_stable_grams(instant_grams)
             water_level = read_water_level()
+
+            global latest_feed_weight, latest_water_level   # if not already global in this scope
+            if instant_grams is not None:
+                latest_feed_weight = instant_grams
+            latest_water_level = water_level
 
             # Slow sensor
             if loop_count % slow_read_loops == 0:
@@ -682,24 +718,29 @@ def main():
             temperature = last_temperature
             humidity = last_humidity
 
+            feed_display = f"{feed_weight:.1f}g" if feed_weight is not None else "N/A"
             print(f"Temp: {temperature}C | Humidity: {humidity}% | "
-                  f"Feed: {feed_weight}g | Water: {water_level}")
+                f"Feed: {feed_display} | Water: {water_level}")
 
             # Push to Firebase every fast loop
-            push_sensor_data(temperature, humidity, feed_weight or 0, water_level)
+            push_sensor_data(temperature, humidity, feed_weight if feed_weight is not None else 0, water_level)
+           
+            # Only hit Firebase for thresholds/schedules every ~30s, not every loop
+            if loop_count % threshold_refresh_loops == 0 or cached_thresholds is None:
+                cached_thresholds = get_active_thresholds()
+                cached_schedules = get_schedules_cached()
+
+            thresholds = cached_thresholds
+            schedules = cached_schedules
 
             # Environmental control only needs to run when temp/humidity
             if loop_count % slow_read_loops == 0 and temperature is not None:
-                thresholds = get_active_thresholds()
                 control_environment(temperature, humidity, thresholds)
-            else:
-                thresholds = get_active_thresholds()
 
             # Check alerts every fast loop 
             check_alerts(feed_weight, water_level, thresholds)
 
             # Check feeding schedules every fast loop 
-            schedules = get_schedules_cached()
             check_schedules_with_data(schedules)
 
             # Update shared state file for the LCD dashboard
