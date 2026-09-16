@@ -31,6 +31,23 @@ heating_lamp_on = False
 exhaust_fan_on = False
 is_dispensing = False  # NEW: master lock so feed+water never overlap
 
+# Per-feeding progress (separate from the capacity-based low-feed alert).
+# This is "how close did THIS feeding get to its own target" - e.g. 100g
+# target -> 100g dispensed = 100%. Persists until the next feeding event
+# so the app/LCD have something to show in between.
+last_feeding_progress = {
+    "percent": None,
+    "grams": None,
+    "target_grams": None,
+    "triggered_by": None,
+    "timestamp": None
+}
+
+# Day-level checklist: ✓ Feeding 1 - 100%, ○ Feeding 2 - 0%, etc.
+# Rebuilt from today's enabled schedule entries whenever the date rolls over.
+daily_feeding_progress = []
+daily_progress_date = None
+
 latest_feed_weight = None
 latest_water_level = None
 
@@ -151,10 +168,6 @@ def control_environment(temperature, humidity, thresholds):
 
         update_actuator_state("heatingLamp", True)
 
-        db.reference("/actuators").update({
-            "heatingLamp": True
-        })
-
         log_actuator(
             "Heating Lamp",
             "ON",
@@ -169,10 +182,6 @@ def control_environment(temperature, humidity, thresholds):
         heating_lamp_on = False
 
         update_actuator_state("heatingLamp", False)
-
-        db.reference("/actuators").update({
-            "heatingLamp": False
-        })
 
         log_actuator(
             "Heating Lamp",
@@ -194,10 +203,6 @@ def control_environment(temperature, humidity, thresholds):
 
         update_actuator_state("exhaustFan", True)
 
-        db.reference("/actuators").update({
-            "exhaustFan": True
-        })
-
         reason = (
             f"Temperature reached {temperature:.1f}°C (above {temp_max}°C)"
             if temperature > temp_max
@@ -205,12 +210,12 @@ def control_environment(temperature, humidity, thresholds):
         )
 
         log_actuator(
-            "Cooling Fan",
+            "Exhaust Fan",
             "ON",
             reason
         )
 
-        print(f"❄ Cooling Fan ON ({temperature:.1f}°C)")
+        print(f"Exhaust Fan ON ({temperature:.1f}°C)")
 
     elif not need_exhaust and exhaust_fan_on:
 
@@ -219,20 +224,16 @@ def control_environment(temperature, humidity, thresholds):
 
         update_actuator_state("exhaustFan", False)
 
-        db.reference("/actuators").update({
-            "exhaustFan": False
-        })
-
         log_actuator(
-            "Cooling Fan",
+            "Exhaust Fan",
             "OFF",
             f"Environment returned to normal ({temperature:.1f}°C)"
         )
 
-        print(f" Cooling Fan OFF ({temperature:.1f}°C)")
+        print(f" Exhaust Fan OFF ({temperature:.1f}°C)")
 
 #  Feed Dispensing 
-def dispense_feed(target_grams, triggered_by="schedule"):
+def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None):
     global is_dispensing_feed
     if is_dispensing_feed:
         return
@@ -250,17 +251,47 @@ def dispense_feed(target_grams, triggered_by="schedule"):
         open_feed()
 
         timeout = time.time() + 30
+        prev_weight = current_weight
+        prev_time = time.time()
+
         while time.time() < timeout:
-            weight = read_grams()
-            if weight is not None and weight >= stop_early_at:
+            weight = read_grams(samples=8, trust_reading=True)
+            now = time.time()
+
+            if weight is not None:
+                elapsed = now - prev_time
+                rate = (weight - prev_weight) / elapsed if elapsed > 0 else 0
+                prev_weight, prev_time = weight, now
+
+                # How much MORE weight will land before the servo physically
+                # finishes closing, based on how fast feed is falling right now
+                predicted_final = weight + (rate * config.SERVO_CLOSE_LATENCY_SECONDS)
+
+            if predicted_final >= target_grams or weight >= stop_early_at:
                 break
-            time.sleep(0.5)
+
+            time.sleep(0.3)
 
         close_feed()
+        
         update_actuator_state("feedServo", False)
-        final_weight = read_grams()
+        final_weight = read_grams(samples=15, trust_reading=True)
         reset_stable_grams(final_weight)
         log_feed(final_weight, triggered_by)
+
+        # target_grams here IS the per-feeding target (e.g. 100g from the
+        # schedule, or current+manual_grams for a manual trigger) - so
+        # final_weight / target_grams is exactly "% of this feeding's goal
+        # reached", which is what the app/LCD should show as "Today's Feeding".
+        global last_feeding_progress
+        feeding_percent = round(min(100, (final_weight / target_grams) * 100)) if target_grams else None
+        last_feeding_progress = {
+            "percent": feeding_percent,
+            "grams": final_weight,
+            "target_grams": target_grams,
+            "triggered_by": triggered_by,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
 
         try:
             db.reference("/notifications").push({
@@ -269,10 +300,17 @@ def dispense_feed(target_grams, triggered_by="schedule"):
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             })
             db.reference('/sensor_data').update({'last_feed_time': int(time.time() * 1000)})
+            db.reference('/sensor_data').update({'feeding_progress': last_feeding_progress})
         except Exception as e:
             print(f"Firebase write failed after dispense (feed already dispensed OK): {e}")
 
-        print(f"Feed dispensed: {final_weight}g")
+        print(f"Feed dispensed: {final_weight}g ({feeding_percent}% of {target_grams}g target)")
+
+        # Only scheduled feedings check off a slot in today's fixed checklist -
+        # manual/LCD dispenses still update last_feeding_progress above, but
+        # they aren't one of the day's planned "Feeding 1 / Feeding 2" slots.
+        if triggered_by == "schedule":
+            mark_feeding_slot_complete(schedule_key, final_weight, target_grams)
     finally:
         is_dispensing_feed = False
         
@@ -293,25 +331,37 @@ def dispense_water(triggered_by="schedule"):
         update_actuator_state("waterServo", True)
         open_water()
 
-        timeout = time.time() + 30
+        # Manual and LCD dispenses use a shorter safety cutoff than scheduled ones
+        timeout_seconds = (
+            config.WATER_DISPENSE_TIMEOUT_MANUAL_SECONDS
+            if triggered_by in ("manual", "lcd")
+            else config.WATER_DISPENSE_TIMEOUT_SECONDS
+        )
+        timeout = time.time() + timeout_seconds
+
         reached_normal = False
+        normal_confirm_count = 0
 
         while time.time() < timeout:
             level = read_water_level()
             if level == "normal":
-                print("Water reached normal. Topping up...")
-                time.sleep(config.WATER_EXTRA_FILL_TIME)
-                reached_normal = True
-                break
-            time.sleep(0.5)
+                normal_confirm_count += 1
+                if normal_confirm_count >= config.WATER_NORMAL_CONFIRM_READS:
+                    print("Water reached normal (confirmed). Topping up...")
+                    time.sleep(config.WATER_EXTRA_FILL_TIME)
+                    reached_normal = True
+                    break
+            else:
+                normal_confirm_count = 0
+            time.sleep(0.3)
 
         close_water()
         update_actuator_state("waterServo", False)
 
         if not reached_normal:
-            print("Water dispense timed out after 30s without reaching 'normal' - check float sensor/servo")
+            print(f"Water dispense timed out after {timeout_seconds}s without reaching 'normal' - check float sensor/servo")
 
-        log_water(triggered_by)
+        log_water(triggered_by) 
 
         try:
             db.reference("/notifications").push({
@@ -326,7 +376,7 @@ def dispense_water(triggered_by="schedule"):
         is_dispensing_water = False
     
 #  Combined Sequential Dispense 
-def run_dispense_sequence(feed_grams=None, do_water=False, triggered_by="schedule"):
+def run_dispense_sequence(feed_grams=None, do_water=False, triggered_by="schedule", schedule_key=None):
     global is_dispensing
     if is_dispensing:
         print("Dispense already in progress, skipping.")
@@ -334,9 +384,12 @@ def run_dispense_sequence(feed_grams=None, do_water=False, triggered_by="schedul
     is_dispensing = True
     try:
         if feed_grams:
-            dispense_feed(feed_grams, triggered_by)   # blocks until feed finishes
+            dispense_feed(feed_grams, triggered_by, schedule_key)   # blocks until feed finishes
+            if do_water:
+                print(f"Feed done - waiting {config.DISPENSE_STAGE_INTERVAL_SECONDS}s before water...")
+                time.sleep(config.DISPENSE_STAGE_INTERVAL_SECONDS)
         if do_water:
-            dispense_water(triggered_by)              # only starts after feed is done
+            dispense_water(triggered_by)              # only starts after feed (+ pause) is done
     finally:
         is_dispensing = False
 
@@ -345,25 +398,31 @@ def get_schedules_cached():
     # Try Firebase (live, up-to-date)
     try:
         schedules = get_schedules()
-        if schedules:
-            try:
-                with open(SCHEDULE_CACHE_FILE, "w") as f:
-                    json.dump(schedules, f)
-            except Exception as e:
-                print(f"Schedule cache write failed: {e}")
-            return schedules
     except Exception as e:
+        # Only an actual exception counts as "Firebase failed" - fall back
+        # to the last-known cache.
         print(f"Schedule fetch failed, checking cache: {e}")
+        try:
+            with open(SCHEDULE_CACHE_FILE, "r") as f:
+                cached = json.load(f)
+                print("Using cached schedules (last known from app)")
+                return cached
+        except Exception:
+            print("No cached schedules available")
+            return None
 
-    #  Firebase failed - fall back to last-known synced schedule
+    # The call succeeded - trust it completely, even if it's empty/None.
+    # An empty result here means schedules were genuinely deleted/disabled,
+    # NOT that the fetch failed - so we must overwrite the cache with that
+    # empty state instead of silently keeping the old one, or a deleted
+    # schedule keeps reappearing on the LCD forever.
     try:
-        with open(SCHEDULE_CACHE_FILE, "r") as f:
-            cached = json.load(f)
-            print("Using cached schedules (last known from app)")
-            return cached
-    except Exception:
-        print("No cached schedules available")
-        return None
+        with open(SCHEDULE_CACHE_FILE, "w") as f:
+            json.dump(schedules or {}, f)
+    except Exception as e:
+        print(f"Schedule cache write failed: {e}")
+
+    return schedules
 
 # Find Next Scheduled Feed (for LCD display)
 def get_next_schedule_info(schedules):
@@ -384,7 +443,7 @@ def get_next_schedule_info(schedules):
 
         days_str = entry.get("days", "Mon,Tue,Wed,Thu,Fri,Sat,Sun")
         days_list = [d.strip() for d in days_str.split(",")]
-        amount = entry.get("amount_grams", 500)
+        amount = entry.get("amount_grams", config.SCHEDULE_FEED_GRAMS)
 
         try:
             sched_hour, sched_min = map(int, sched_time.split(":"))
@@ -416,6 +475,81 @@ def get_next_schedule_info(schedules):
         "day": best[3],
         "amount_grams": best[2]
     }
+
+#  Daily Feeding Checklist (✓ Feeding 1, ○ Feeding 2, ...) 
+def get_daily_feeding_slots(schedules):
+    """Today's enabled schedule entries, in time order."""
+    if not schedules:
+        return []
+
+    today_day = datetime.now().strftime("%a")
+    slots = []
+    for key, entry in schedules.items():
+        if not isinstance(entry, dict) or not entry.get("enabled", True):
+            continue
+        sched_time = entry.get("time")
+        if not sched_time:
+            continue
+        days_str = entry.get("days", "Mon,Tue,Wed,Thu,Fri,Sat,Sun")
+        days_list = [d.strip() for d in days_str.split(",")]
+        if today_day not in days_list:
+            continue
+        slots.append({
+            "key": key,
+            "time": sched_time,
+            "target_grams": entry.get("amount_grams", config.SCHEDULE_FEED_GRAMS)
+        })
+
+    slots.sort(key=lambda s: s["time"])
+    return slots
+
+def refresh_daily_feeding_progress(schedules):
+    """Rebuild the checklist once per day (midnight rollover). Cheap to call
+    every loop - it no-ops unless the date has actually changed."""
+    global daily_feeding_progress, daily_progress_date
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if daily_progress_date == today_str and daily_feeding_progress:
+        return
+
+    slots = get_daily_feeding_slots(schedules)
+    daily_feeding_progress = [
+        {
+            "label": f"Feeding {i + 1}",
+            "key": slot["key"],
+            "time": slot["time"],
+            "target_grams": slot["target_grams"],
+            "completed": False,
+            "percent": 0,
+            "grams": 0,
+            "timestamp": None
+        }
+        for i, slot in enumerate(slots)
+    ]
+    daily_progress_date = today_str
+    push_daily_feeding_progress()
+    print(f"Daily feeding checklist rebuilt for {today_str}: {len(daily_feeding_progress)} feeding(s)")
+
+def mark_feeding_slot_complete(schedule_key, final_weight, target_grams):
+    """Called after a SCHEDULED feed finishes (not manual/LCD, since those
+    aren't part of the fixed daily checklist)."""
+    if not schedule_key:
+        return
+    for slot in daily_feeding_progress:
+        if slot["key"] == schedule_key:
+            percent = round(min(100, (final_weight / target_grams) * 100)) if target_grams else 0
+            slot["completed"] = True
+            slot["percent"] = percent
+            slot["grams"] = final_weight
+            slot["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            break
+    push_daily_feeding_progress()
+
+def push_daily_feeding_progress():
+    try:
+        db.reference("/sensor_data/today_feedings").set(daily_feeding_progress)
+    except Exception as e:
+        print(f"Firebase write failed for today_feedings: {e}")
 
 #  Schedule Checker 
 def check_schedules_with_data(schedules):
@@ -454,11 +588,11 @@ def check_schedules_with_data(schedules):
             if today_day not in days_list:
                 continue
 
-            amount = entry.get("amount_grams", 500)
+            amount = entry.get("amount_grams", config.SCHEDULE_FEED_GRAMS)
 
             threading.Thread(
                 target=run_dispense_sequence,
-                args=(amount, True, "schedule")
+                args=(amount, True, "schedule", key)
             ).start()
 
             fired_schedules_this_minute.add(key)
@@ -641,14 +775,15 @@ def check_alerts(feed_weight, water_level, thresholds):
 # Shared State Writer (for LCD dashboard) 
 SHARED_STATE_FILE = "shared_state.json"        
 
-def write_shared_state(temperature, humidity, feed_weight, water_level, thresholds, next_schedule=None, system_online=True):
+def write_shared_state(temperature, humidity, feed_weight, water_level, thresholds, next_schedule=None, system_online=True, today_feedings=None):
     feed_percent = (feed_weight / config.FEED_CAPACITY_GRAMS * 100) if feed_weight is not None else None
     
     state = {
         "temperature": temperature,
         "humidity": humidity,
         "feed_weight": feed_weight,
-        "feed_percent": feed_percent,
+        "feed_percent": feed_percent,          # hopper-capacity % (low-feed alert basis, unchanged)
+        "feeding_progress": last_feeding_progress,  # per-feeding target % (e.g. 100g = 100%)
         "water_level": water_level,
         "feed_low_threshold": thresholds.get("feedLow", 20),
         "temp_min_threshold": thresholds.get("tempMin", config.DEFAULT_TEMP_MIN),
@@ -661,6 +796,7 @@ def write_shared_state(temperature, humidity, feed_weight, water_level, threshol
         "exhaust_fan_on": exhaust_fan_on,
         "system_online": system_online,
         "next_schedule": next_schedule,
+        "today_feedings": today_feedings or [],
         "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     try:
@@ -722,8 +858,18 @@ def main():
             print(f"Temp: {temperature}C | Humidity: {humidity}% | "
                 f"Feed: {feed_display} | Water: {water_level}")
 
-            # Push to Firebase every fast loop
-            push_sensor_data(temperature, humidity, feed_weight if feed_weight is not None else 0, water_level)
+            # Calculate once here, then push in the SAME call as the rest of
+            # the sensor data - one write, one round trip, instead of two.
+            feed_percent_for_app = (
+                round(min(100, (feed_weight / config.FEED_CAPACITY_GRAMS) * 100), 1)
+                if feed_weight is not None else None
+            )
+            
+            push_sensor_data(
+                temperature, humidity, feed_weight or 0, water_level,
+                feed_percent=feed_percent_for_app,
+                extra_updates={"actuators/exhaustFan": exhaust_fan_on}  # only when it changed this tick
+            )
            
             # Only hit Firebase for thresholds/schedules every ~30s, not every loop
             if loop_count % threshold_refresh_loops == 0 or cached_thresholds is None:
@@ -733,8 +879,14 @@ def main():
             thresholds = cached_thresholds
             schedules = cached_schedules
 
-            # Environmental control only needs to run when temp/humidity
-            if loop_count % slow_read_loops == 0 and temperature is not None:
+            # Rebuilds only at midnight rollover - cheap to call every loop
+            refresh_daily_feeding_progress(schedules)
+
+            # Environmental control runs every fast loop using the latest
+            # known reading — hysteresis timing and threshold changes
+            # apply promptly, even though the DHT22 itself only refreshes
+            # on the slow interval.
+            if temperature is not None:
                 control_environment(temperature, humidity, thresholds)
 
             # Check alerts every fast loop 

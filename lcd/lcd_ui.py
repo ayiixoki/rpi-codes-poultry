@@ -2,8 +2,10 @@ import tkinter as tk
 from tkinter import font as tkfont
 from PIL import Image, ImageTk
 import json
+import sys
 import os
-
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))  # adjust ../ to point at the main folder
+import config
 
 SHARED_STATE_FILE = "shared_state.json"
 LCD_COMMANDS_FILE = "lcd_commands.json"
@@ -11,7 +13,7 @@ POLL_MS = 50  # how often the dashboard refreshes from shared_state.json
 
 # TODO: actual max capacity (in grams) of your feed bowl.
 # The feed card now displays a percentage of this value instead of raw grams.
-FEED_CAPACITY_GRAMS = 500
+FEED_CAPACITY_GRAMS = 200
 
 
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
@@ -229,14 +231,17 @@ class PoultryDashboard(tk.Tk):
         )
         feed_title.pack(fill="x")
 
-        self.custom_grams = tk.IntVar(value=100)
-        self.custom_grams_display = tk.StringVar(value="100 g")
+        # Manual dispense now steps in 10% increments of the per-feeding
+        # target (config.SCHEDULE_FEED_GRAMS, e.g. 100g = 100%) instead of
+        # raw grams, matching the percentage shown everywhere else.
+        self.custom_percent = tk.IntVar(value=10)
+        self.custom_percent_display = tk.StringVar(value="10 %")
 
         custom_frame = tk.Frame(feed_frame, bg=BG_DARK)
         custom_frame.pack(fill="x", pady=(6, 0))
 
         custom_title = tk.Label(
-            custom_frame, text="Enter Custom Amount of Feeds (g):", font=self.font_small,
+            custom_frame, text="Feed Amount (% of feeding target):", font=self.font_small,
             bg=BG_DARK, fg=TEXT_MAIN, anchor="w"
         )
         custom_title.pack(fill="x")
@@ -248,21 +253,21 @@ class PoultryDashboard(tk.Tk):
             stepper_row, text="−", font=self.font_button,
             bg=BG_CARD_ALT, fg="white", activebackground="#3f4854",
             relief="flat", width=3, height=1,
-            command=lambda: self._adjust_custom_grams(-10)
+            command=lambda: self._adjust_custom_percent(-10)
         )
         minus_btn.pack(side="left", fill="y", padx=(0, 6))
 
-        self.custom_grams_label = tk.Label(
-            stepper_row, textvariable=self.custom_grams_display, font=self.font_med,
+        self.custom_percent_label = tk.Label(
+            stepper_row, textvariable=self.custom_percent_display, font=self.font_med,
             bg=BG_CARD_ALT, fg=TEXT_MAIN, width=8
         )
-        self.custom_grams_label.pack(side="left", fill="both", expand=True, padx=6)
+        self.custom_percent_label.pack(side="left", fill="both", expand=True, padx=6)
 
         plus_btn = tk.Button(
             stepper_row, text="+", font=self.font_button,
             bg=BG_CARD_ALT, fg="white", activebackground="#3f4854",
             relief="flat", width=3, height=1,
-            command=lambda: self._adjust_custom_grams(10)
+            command=lambda: self._adjust_custom_percent(10)
         )
         plus_btn.pack(side="left", fill="y", padx=(6, 0))
 
@@ -270,7 +275,7 @@ class PoultryDashboard(tk.Tk):
             custom_frame, text="Dispense Feeds", font=self.font_button,
             bg=ACCENT_GREEN, fg="white", activebackground="#3d8a63",
             relief="flat", height=2,
-            command=lambda: self._dispense_feed(self.custom_grams.get())
+            command=lambda: self._dispense_feed(self.custom_percent.get())
         )
         self.custom_dispense_btn.pack(fill="x", pady=(4, 0))
 
@@ -330,23 +335,32 @@ class PoultryDashboard(tk.Tk):
         card._name_label.config(bg=bg)
         state_label.config(text="ON" if is_on else "OFF", bg=bg, fg=fg)
 
-    def _adjust_custom_grams(self, delta):
-        MIN_GRAMS = 10
-        MAX_GRAMS = 1000
-        new_value = self.custom_grams.get() + delta
-        new_value = max(MIN_GRAMS, min(MAX_GRAMS, new_value))
-        self.custom_grams.set(new_value)
-        self.custom_grams_display.set(f"{new_value} g")
+    def _adjust_custom_percent(self, delta):
+        # Steps 10 -> 20 -> ... -> 100%. 100% caps at exactly one full
+        # feeding target (config.SCHEDULE_FEED_GRAMS) - manual dispenses
+        # from this dashboard can't exceed a single feeding's worth in
+        # one press.
+        MIN_PERCENT = 10
+        MAX_PERCENT = 100
+        new_value = self.custom_percent.get() + delta
+        new_value = max(MIN_PERCENT, min(MAX_PERCENT, new_value))
+        self.custom_percent.set(new_value)
+        self.custom_percent_display.set(f"{new_value} %")
 
     def _exit_app(self):
         self.destroy()
 
-    def _dispense_feed(self, grams):
+    def _dispense_feed(self, percent):
+        # The Pi's dispense logic (main.py / lcd_command_watcher) still
+        # works in grams, so convert the percentage back to grams here,
+        # right at the boundary, before writing the command file.
+        grams = round((percent / 100) * config.SCHEDULE_FEED_GRAMS)
+
         # Instant visual feedback so the press feels responsive even before
         # the Pi confirms via shared_state.json.
-        self._flash_button(self.custom_dispense_btn, f"Sending {grams}g...")
+        self._flash_button(self.custom_dispense_btn, f"Sending {percent}%...")
         self._write_command(feed_requested=True, feed_grams=grams)
-        self.status_label.config(text=f"Feed command sent: {grams}g", fg=ACCENT_AMBER)
+        self.status_label.config(text=f"Feed command sent: {percent}% ({grams}g)", fg=ACCENT_AMBER)
 
     def _dispense_water(self):
         self._flash_button(self.water_btn, "Sending...")
@@ -402,7 +416,7 @@ class PoultryDashboard(tk.Tk):
         last_updated = state.get("last_updated", "")
         is_feeding = state.get("is_dispensing_feed", False)
         is_watering = state.get("is_dispensing_water", False)
-        feed_low = state.get("feed_low_threshold", 200)
+        feed_low = state.get("feed_low_threshold", 20)
         temp_min = state.get("temp_min_threshold")
         temp_max = state.get("temp_max_threshold")
         hum_min = state.get("hum_min_threshold")
@@ -434,12 +448,13 @@ class PoultryDashboard(tk.Tk):
         else:
             self._set_badge(self.hum_badge, "--", "normal")
 
-        # Feed level shown as a percentage of bowl capacity. The low/normal
-        # badge still compares the raw gram reading against your threshold
-        # (e.g. 200g) so the accuracy of that comparison isn't affected by
-        # the display unit change.
-        if feed is not None:
-            feed_pct = max(0, min(100, (feed / FEED_CAPACITY_GRAMS) * 100)) if FEED_CAPACITY_GRAMS else 0
+        # Feed level: use the percentage the Pi already computed
+        # (feed_percent, based on config.FEED_CAPACITY_GRAMS) rather than
+        # recalculating it here from raw grams with a second, separate
+        # capacity constant.
+        feed_pct = state.get("feed_percent")
+        if feed_pct is not None:
+            feed_pct = max(0, min(100, feed_pct))
             is_low = feed_pct < feed_low
             feed_color = ACCENT_RED if is_low else TEXT_MAIN
             self.feed_value.config(text=f"{feed_pct:.0f} %", fg=feed_color)

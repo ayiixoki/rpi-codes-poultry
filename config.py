@@ -10,7 +10,7 @@ WATER_SERVO_PIN = 25
 
 # Default thresholds (fallback if Firebase unreachable)
 DEFAULT_TEMP_MIN = 32
-DEFAULT_TEMP_MAX = 37
+DEFAULT_TEMP_MAX = 34
 DEFAULT_HUM_MIN = 50
 DEFAULT_HUM_MAX = 70
 
@@ -19,10 +19,20 @@ HX711_OFFSET = -17369
 HX711_SCALE = 412.65
 GRAMS_PER_SECOND = 5
 
+SERVO_CLOSE_LATENCY_SECONDS = 0.30  # placeholder — measure this for real, see below
+SERVO_CLOSE_LATENCY = 0.20   # seconds — how long servo takes to fully stop feed after command sent
+TARGET_WEIGHT = 200           # grams — your dispense target
+
 DEFAULT_MANUAL_DISPENSE_GRAMS = 200
+# Feed hopper capacity
+FEED_CAPACITY_GRAMS = 200
 MANUAL_COMMAND_POLL_INTERVAL = 0.1
 
-FEED_CAPACITY_GRAMS = 500 
+SCHEDULE_FEED_GRAMS = 200          # default per-schedule dispense amount (2x/day = 200g/day)
+DISPENSE_STAGE_INTERVAL_SECONDS = 3  # pause between feed servo closing and water servo opening
+WATER_NORMAL_CONFIRM_READS = 3      # consecutive "normal" float reads required before closing water valve
+WATER_DISPENSE_TIMEOUT_SECONDS = 90  # safety cutoff if float sensor never reports "normal"
+WATER_DISPENSE_TIMEOUT_MANUAL_SECONDS = 50  # manual dispense safety cutoff
 
 # Sensor read interval (seconds)
 FAST_READ_INTERVAL = 1    # seconds - feed weight + water level

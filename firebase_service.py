@@ -9,9 +9,6 @@ def init_firebase():
             "databaseURL": "https://poultrycare-f816d-default-rtdb.asia-southeast1.firebasedatabase.app"
         })
         
-        # When RPi loses WiFi/crashes, set system_online to False
-        db.reference('/sensor_data/system_online').set(False)
-        
         # On successful connection, set system_online to True
         db.reference('/sensor_data/system_online').set(True)
         print("? Firebase initialized successfully")
@@ -21,22 +18,24 @@ def init_firebase():
         raise
 
 
-def push_sensor_data(temperature, humidity, feed_weight_grams, water_level):
-   
+def push_sensor_data(temperature, humidity, feed_weight_grams, water_level, feed_percent=None, extra_updates=None):
     try:
-        ref = db.reference("/sensor_data")
-        
-        ref.update({
-            "temperature": temperature,
-            "humidity": humidity,
-            "feed_level": feed_weight_grams,      # ? In grams, NOT kg
-            "water_level": water_level.upper(),   # ? Uppercase ("FULL", "LOW", "EMPTY")
-            "system_online": True,                # ? Underscore, not space
-            "last_updated": int(time.time() * 1000),
-        })
-        
+        update_data = {
+            "sensor_data/temperature": temperature,
+            "sensor_data/humidity": humidity,
+            "sensor_data/feed_level": feed_weight_grams,
+            "sensor_data/water_level": water_level.upper(),
+            "sensor_data/system_online": True,
+            "sensor_data/last_updated": int(time.time() * 1000),
+        }
+        if feed_percent is not None:
+            update_data["sensor_data/feed_percent"] = feed_percent
+        if extra_updates:
+            update_data.update(extra_updates)  # e.g. actuator states this tick
+
+        db.reference("/").update(update_data)   # ONE round trip, root-level multi-path update
     except Exception as e:
-        print(f"? Error pushing sensor data: {e}")
+        print(f"Error pushing sensor data: {e}")
 
 
 def set_feed_max(capacity_grams):
