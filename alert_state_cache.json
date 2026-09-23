@@ -1,1 +1,1 @@
-{"feed_low_active": false, "water_low_active": false, "temp_high_active": false, "temp_low_active": true, "hum_high_active": true}
+{"feed_low_active": true, "water_low_active": false, "temp_high_active": false, "temp_low_active": true, "hum_high_active": true}
