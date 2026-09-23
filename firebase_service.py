@@ -91,8 +91,37 @@ def get_schedules():
         return {}
 
 def write_log(entry):
-    db.reference("logs").push(entry)
-    trim_logs()
+    try:
+        db.reference("logs").push(entry)
+    except Exception as e:
+        print(f"Error writing log: {e}")
+        return  # don't attempt trim if the write itself failed
+
+    try:
+        trim_logs()
+    except Exception as e:
+        print(f"Error trimming logs: {e}")
+
+
+def trim_logs(limit=200):
+    logs = db.reference("logs").get()
+
+    if not logs:
+        return
+
+    if len(logs) <= limit:
+        return
+
+    # Skip any malformed entries instead of crashing the whole sort.
+    valid_entries = [
+        (key, val) for key, val in logs.items()
+        if isinstance(val, dict) and "timestamp" in val
+    ]
+
+    ordered = sorted(valid_entries, key=lambda x: x[1]["timestamp"])
+
+    for key, _ in ordered[:-limit]:
+        db.reference(f"logs/{key}").delete()
         
 def trim_logs(limit=200):
     logs = db.reference("logs").get()

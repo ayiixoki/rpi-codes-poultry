@@ -14,13 +14,6 @@ _current_offset = None
 
 
 def setup_hx711(warmup_reads=5, warmup_delay=1.0):
-    """Initialize the HX711 object. Safe to call multiple times.
-
-    Discards a handful of raw readings right after power-up/reset before
-    returning - the HX711's first readings after reset are inherently
-    unstable (ADC settling time), independent of anything physically on
-    the plate. Skipping these avoids feeding garbage values into
-    read_grams()'s jitter filter (_last_valid_grams) at startup."""
     global _hx
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
@@ -30,7 +23,7 @@ def setup_hx711(warmup_reads=5, warmup_delay=1.0):
 
     time.sleep(warmup_delay)
     for _ in range(warmup_reads):
-        _hx.get_raw_data_mean(readings=5)  # discarded - just letting the ADC settle
+        _hx.get_raw_data_mean(readings=5)  # discarded - ADC settling
 
     return _hx
 
@@ -111,18 +104,12 @@ def read_weight(offset, scale):
     """Read weight in grams (legacy signature, kept for compatibility)."""
     return read_grams(offset=offset, scale=scale)
 
-def read_filtered_weight(hx, samples=3):
-    """Returns a noise-filtered weight reading using median-of-3."""
-    readings = [hx.get_weight(1) for _ in range(samples)]
-    readings.sort()
-    return readings[len(readings) // 2]  # median
-
-
 _last_valid_grams = None
 _pending_value = None
 _pending_count = 0
 MAX_PLAUSIBLE_DELTA_G = 100       # single-reading jump considered "suspicious"
-CONFIRM_READS_REQUIRED = 3        # how many consistent readings needed to accept a big jump
+CONFIRM_READS_REQUIRED = 1        # how many consistent readings needed to accept a big jump
+DEBUG_GRAMS = True                # set to False to silence the debug print
 
 def read_grams(offset=None, scale=None, samples=15, trust_reading=False):
     global _last_valid_grams, _pending_value, _pending_count
@@ -138,7 +125,10 @@ def read_grams(offset=None, scale=None, samples=15, trust_reading=False):
     # Clamp to [0, FEED_CAPACITY_GRAMS] - the feeder physically cannot hold
     # more than its capacity, so any reading above that is noise, not real
     # feed. This keeps LCD/app percentage displays from exceeding 100%.
-    weight = max(0.0, min(config.FEED_CAPACITY_GRAMS, round((raw - offset) / scale, 1)))
+    real_grams = round((raw - offset) / scale, 1)
+    if DEBUG_GRAMS:
+        print(f"[LOADCELL] raw={raw:.0f} offset={offset:.0f} scale={scale} real_grams={real_grams}g (cap={config.FEED_CAPACITY_GRAMS}g)")
+    weight = max(0.0, min(config.FEED_CAPACITY_GRAMS, real_grams))
 
     if trust_reading:
         _last_valid_grams = weight

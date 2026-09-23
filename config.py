@@ -19,20 +19,24 @@ HX711_OFFSET = -17369
 HX711_SCALE = 412.65
 GRAMS_PER_SECOND = 5
 
-SERVO_CLOSE_LATENCY_SECONDS = 0.30  # placeholder — measure this for real, see below
+SERVO_CLOSE_LATENCY_SECONDS = 0.25  # placeholder — measure this for real, see below
 SERVO_CLOSE_LATENCY = 0.20   # seconds — how long servo takes to fully stop feed after command sent
 TARGET_WEIGHT = 200           # grams — your dispense target
 
 DEFAULT_MANUAL_DISPENSE_GRAMS = 200
 # Feed hopper capacity
-FEED_CAPACITY_GRAMS = 200
+FEED_CAPACITY_GRAMS = 150
 MANUAL_COMMAND_POLL_INTERVAL = 0.1
 
 SCHEDULE_FEED_GRAMS = 200          # default per-schedule dispense amount (2x/day = 200g/day)
 DISPENSE_STAGE_INTERVAL_SECONDS = 3  # pause between feed servo closing and water servo opening
+
 WATER_NORMAL_CONFIRM_READS = 3      # consecutive "normal" float reads required before closing water valve
-WATER_DISPENSE_TIMEOUT_SECONDS = 90  # safety cutoff if float sensor never reports "normal"
+WATER_DISPENSE_TIMEOUT_SECONDS = 180  # safety cutoff if float sensor never reports "normal"
 WATER_DISPENSE_TIMEOUT_MANUAL_SECONDS = 50  # manual dispense safety cutoff
+WATER_EXTRA_FILL_TIME = 20  #seconds to keep the water pump running after the water level sensor reads "normal" to ensure the water is topped up
+
+FEED_HYSTERESIS_PERCENT = 5
 
 # Sensor read interval (seconds)
 FAST_READ_INTERVAL = 1    # seconds - feed weight + water level
@@ -47,7 +51,6 @@ HUM_HYSTERESIS = 1.0       # %
 
 DISPENSE_OVERSHOOT_BUFFER_GRAMS = 2  # stop this many grams early to account for feed still falling after servo closes
 
-WATER_EXTRA_FILL_TIME = 1.0 #seconds to keep the water pump running after the water level sensor reads "normal" to ensure the water is topped up
-
 EXHAUST_MIN_RUN_SECONDS = 180      # fan must run at least this long once it starts
-HUM_CRITICAL_BUFFER = 10           # humidity this far above humMax overrides heat need
+
+FEED_DISPENSE_TIMEOUT_SECONDS = 30  # fail-safe only, the servo normally closes when the sensor reaches the target
