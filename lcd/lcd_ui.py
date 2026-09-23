@@ -460,9 +460,9 @@ class PoultryDashboard(tk.Tk):
         # (feed_percent, based on the live hopper capacity) rather than
         # recalculating it here with a second, separate capacity constant.
         feed_pct = state.get("feed_percent")
+        is_low = state.get("feed_low_active", False)   # <-- from Firebase-fed shared_state, not recomputed
         if feed_pct is not None:
             feed_pct = max(0, min(100, feed_pct))
-            is_low = feed_pct < feed_low
             feed_color = ACCENT_RED if is_low else TEXT_MAIN
             self.feed_value.config(text=f"{feed_pct:.0f} %", fg=feed_color)
             self._set_badge(self.feed_badge, "Low" if is_low else "Normal", "low" if is_low else "normal")

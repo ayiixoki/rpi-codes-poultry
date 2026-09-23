@@ -174,3 +174,9 @@ def update_actuator_state(actuator_name, state):
         db.reference(f"/actuators/{actuator_name}").set(state)
     except Exception as e:
         print(f"Error updating {actuator_name}: {e}")
+
+def update_feed_alert_state(is_low):
+    try:
+        db.reference("/sensor_data/feed_low_active").set(is_low)
+    except Exception as e:
+        print(f"Error updating feed_low_active: {e}")

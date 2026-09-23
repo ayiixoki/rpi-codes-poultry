@@ -7,6 +7,7 @@ import RPi.GPIO as GPIO
 from firebase_service import (
     init_firebase, push_sensor_data, get_thresholds,
     get_schedules, update_actuator_state, write_log, send_alert_push
+    update_feed_alert_state
 )
 from sensors.dht22 import read_dht22
 from sensors.load_cell import setup_hx711, read_grams, update_stable_grams, reset_stable_grams
@@ -270,7 +271,7 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None):
                 # repeating the same aggressive guess and overshooting.
                 if remaining <= 3:
                     correction = 0.3   # final fine-tuning pulses: tiny bites
-                elif remaining <= 10:
+                elif remaining <= 10:       
                     correction = 0.5
                 else:
                     correction = 0.3
@@ -849,6 +850,7 @@ def check_alerts(feed_weight, water_level, temperature, humidity, thresholds):
                 "Low Feed Alert",
                 f"Feed level is low ({feed_percent:.0f}% remaining)"
             )
+            update_feed_alert_state(True)
             print(f"Low Feed: {feed_weight:.0f} g ({feed_percent:.0f}%)")
 
         # Feed restored - must climb feed_hysteresis % above the threshold
@@ -856,6 +858,7 @@ def check_alerts(feed_weight, water_level, temperature, humidity, thresholds):
         elif feed_percent >= (feed_low_threshold + feed_hysteresis) and feed_low_active:
             feed_low_active = False
             log_alert("Feed Restocked", f"{feed_weight:.0f} g available ({feed_percent:.0f}%)")
+            update_feed_alert_state(False) 
             print(f"Feed Restocked: {feed_weight:.0f} g ({feed_percent:.0f}%)")
 
     # -------------------------
@@ -902,6 +905,7 @@ def write_shared_state(temperature, humidity, feed_weight, water_level, threshol
         "temperature": temperature,
         "humidity": humidity,
         "feed_weight": feed_weight,
+        "feed_low_active": feed_low_active,
         "feed_percent": feed_percent,          # hopper-capacity % (low-feed alert basis, unchanged)
         "feed_capacity_grams": get_feed_capacity(), 
         "feeding_progress": last_feeding_progress,  # per-feeding target % (e.g. 100g = 100%)
@@ -931,6 +935,7 @@ def main():
     global cached_thresholds, cached_schedules
     init_firebase()
     load_alert_state()
+    update_feed_alert_state(feed_low_active)
     setup_relay()
     setup_hx711()
     setup_float_sensor()
@@ -1011,6 +1016,19 @@ def main():
 
             # Check alerts every fast loop 
             check_alerts(feed_weight, water_level, temperature, humidity, thresholds)
+
+            # Persist active-flag state so a restart doesn't re-fire alerts
+            # that are already active (see alert_state_patch.py).
+            save_alert_state()
+
+            # Publish the hysteresis-aware flag itself, so the app and LCD show
+            # the SAME "low" state as this function just computed, instead of
+            # each recomputing feed_percent < threshold on their own with no
+            # hysteresis memory.
+            try:
+                db.reference('/sensor_data').update({'feed_low_active': feed_low_active})
+            except Exception as e:
+                print(f"Feed alert state Firebase write failed: {e}")
 
             # Check feeding schedules every fast loop 
             check_schedules_with_data(schedules)
