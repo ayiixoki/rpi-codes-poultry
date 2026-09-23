@@ -230,15 +230,11 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None):
     if is_dispensing_feed:
         return
 
-    current_weight = latest_feed_weight if latest_feed_weight is not None else read_grams()
+    current_weight = latest_feed_weight if latest_feed_weight is not None else read_grams(capacity=get_feed_capacity())
     start_weight = current_weight if current_weight is not None else 0
 
-    # Scheduled amount is ADDED on top of whatever feed is already on the plate.
-    # (Manual and LCD already arrive as current + grams.)
-    if triggered_by == "schedule":
-        target_grams = start_weight + target_grams
-
-    # The reading can't go above capacity, so never aim past it
+    # target_grams is always the ABSOLUTE amount that should be on the plate
+    # when dispensing finishes — independent of what's already there.
     target_grams = min(target_grams, get_feed_capacity())
 
     if start_weight >= target_grams:
@@ -250,44 +246,73 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None):
     is_dispensing_feed = True
     try:
         stop_early_at = target_grams - config.DISPENSE_OVERSHOOT_BUFFER_GRAMS
-        print(f"Dispensing feed: {start_weight}g -> target {target_grams}g (adding {amount_requested}g, closing early at {stop_early_at}g)")
+        print(f"Dispensing feed (adaptive): {start_weight}g -> target {target_grams}g (adding {amount_requested}g, closing early at {stop_early_at}g)")
         update_actuator_state("feedServo", True)
-        open_feed()
+
         timeout = time.time() + config.FEED_DISPENSE_TIMEOUT_SECONDS
-        prev_weight = start_weight
-        prev_time = time.time()
-        reached_target = False
+        current_weight = start_weight
+        measured_rate = None  # grams per second, learned from actual pulses
 
-        while time.time() < timeout:
-            weight = read_grams(samples=8, trust_reading=True)
-            now = time.time()
+        # First pulse is a short PROBE - its only job is to measure this
+        # feeder's real flow rate so every pulse after it can be sized
+        # exactly, instead of relying on fixed time buckets.
+        PROBE_SECONDS = 0.08
 
-            if weight is None:
-                time.sleep(0.3)
-                continue
+        while time.time() < timeout and current_weight < stop_early_at:
+            remaining = stop_early_at - current_weight
 
-            elapsed = now - prev_time
-            rate = (weight - prev_weight) / elapsed if elapsed > 0 else 0
-            prev_weight, prev_time = weight, now
-            predicted_final = weight + (rate * config.SERVO_CLOSE_LATENCY_SECONDS)
+            if measured_rate is None:
+                pulse_seconds = PROBE_SECONDS
+            else:
+                # Exact time needed for the remaining grams at the measured
+                # rate. Correction factor shrinks the closer we get, so
+                # later pulses take smaller, more cautious bites instead of
+                # repeating the same aggressive guess and overshooting.
+                if remaining <= 3:
+                    correction = 0.3   # final fine-tuning pulses: tiny bites
+                elif remaining <= 10:
+                    correction = 0.5
+                else:
+                    correction = 0.3
+                pulse_seconds = min(1.0, max(0.03, (remaining / measured_rate) * correction))
 
-            if predicted_final >= target_grams or weight >= stop_early_at:
-                reached_target = True
+            before = current_weight
+            pulse_start = time.time()
+
+            open_feed()
+            time.sleep(pulse_seconds)
+            close_feed()
+
+            actual_pulse_time = time.time() - pulse_start
+            time.sleep(config.SERVO_CLOSE_LATENCY_SECONDS)  # let settling/momentum finish before measuring
+
+            current_weight = read_grams(samples=8, trust_reading=True, capacity=get_feed_capacity())
+            if current_weight is None:
+                current_weight = before
+
+            dispensed_this_pulse = current_weight - before
+            if actual_pulse_time > 0 and dispensed_this_pulse > 0:
+                # Update the measured rate every pulse, so it keeps adapting
+                # as the hopper empties or feed settles differently.
+                measured_rate = dispensed_this_pulse / actual_pulse_time
+
+            print(f"  Pulse {pulse_seconds:.2f}s -> +{dispensed_this_pulse:.1f}g, plate now {current_weight}g "
+                  f"(rate ~{measured_rate:.1f}g/s)" if measured_rate else
+                  f"  Pulse {pulse_seconds:.2f}s -> +{dispensed_this_pulse:.1f}g, plate now {current_weight}g")
+
+            if current_weight >= stop_early_at:
                 break
 
-            time.sleep(0.3)
-
-        close_feed()
-        if not reached_target:
-            print(f"Feed fail-safe: {target_grams}g not reached after {config.FEED_DISPENSE_TIMEOUT_SECONDS}s, servo closed. Check hopper, servo and load cell.")
-
         update_actuator_state("feedServo", False)
-        final_weight = read_grams(samples=15, trust_reading=True)
+        reached_target = current_weight >= stop_early_at
+        if not reached_target and time.time() >= timeout:
+            print(f"Feed fail-safe: {target_grams}g not reached after {config.FEED_DISPENSE_TIMEOUT_SECONDS}s. Check hopper, servo and load cell.")
+
+        final_weight = read_grams(samples=15, trust_reading=True, capacity=get_feed_capacity())
         if final_weight is None:
-            final_weight = start_weight
+            final_weight = current_weight
         reset_stable_grams(final_weight)
 
-        # What was actually added this feeding (not the total on the plate)
         dispensed = max(0.0, round(final_weight - start_weight, 1))
         log_feed(dispensed, triggered_by)
 
@@ -433,20 +458,24 @@ def get_next_schedule_info(schedules):
 
     now = datetime.now()
     day_map = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    best = None  # (minutes_from_now, time_str, amount)
+    best = None
 
     for key, entry in schedules.items():
         if not isinstance(entry, dict) or not entry.get("enabled", True):
             continue
 
-        sched_time = entry.get("time")  
+        sched_time = entry.get("time")
         if not sched_time:
             continue
 
         days_str = entry.get("days", "Mon,Tue,Wed,Thu,Fri,Sat,Sun")
         days_list = [d.strip() for d in days_str.split(",")]
-        
-        amount = entry.get("amount_grams")
+
+        percent = entry.get("percent")
+        if percent:
+            amount = round(get_feed_capacity() * percent / 100)
+        else:
+            amount = entry.get("amount_grams")
         if not amount:
             continue
 
@@ -455,18 +484,16 @@ def get_next_schedule_info(schedules):
         except Exception:
             continue
 
-        # Check the next 7 days starting today to find the closest upcoming schedule
         for offset in range(7):
             check_day = (now.weekday() + offset) % 7
             if day_map[check_day] not in days_list:
                 continue
 
             candidate = now.replace(hour=sched_hour, minute=sched_min, second=0, microsecond=0)
-            candidate = candidate.replace(day=candidate.day)  
             candidate_full = candidate + timedelta(days=offset)
 
             if candidate_full <= now:
-                continue  # today but already passed - skip to next matching day
+                continue
 
             minutes_away = (candidate_full - now).total_seconds() / 60
             if best is None or minutes_away < best[0]:
@@ -518,9 +545,17 @@ def check_schedules_with_data(schedules):
             if today_day not in days_list:
                 continue
 
-            amount = entry.get("amount_grams")
+            # Prefer "percent" (of the user-configured hopper capacity,
+            # recomputed live) over the frozen "amount_grams" fallback that
+            # older schedules (saved before percent-based storage) still use.
+            percent = entry.get("percent")
+            if percent:
+                amount = round(get_feed_capacity() * percent / 100)
+            else:
+                amount = entry.get("amount_grams")
+
             if not amount:
-                print(f"Schedule {key} has no amount set in the app - skipping")
+                print(f"Schedule {key} has no percent or amount set - skipping")
                 fired_schedules_this_minute.add(key)
                 continue
 
@@ -560,7 +595,7 @@ def check_manual_commands():
             else:
                 current = latest_feed_weight
                 if current is None:
-                    current = read_grams(samples=3, trust_reading=True) or 0
+                    current = read_grams(samples=3, trust_reading=True, capacity=get_feed_capacity()) or 0
                 target = current + manual_grams
                 print(f"Manual feed: current {current}g + {manual_grams}g -> target {target}g")
         except Exception as e:
@@ -612,7 +647,7 @@ def check_lcd_commands():
         if manual_grams > 0:
             current = latest_feed_weight
             if current is None:
-                current = read_grams(samples=3, trust_reading=True) or 0
+                current = read_grams(samples=3, trust_reading=True, capacity=get_feed_capacity()) or 0
             target = current + manual_grams
             print(f"LCD manual feed: current {current}g + {manual_grams}g -> target {target}g")
         else:
@@ -868,6 +903,7 @@ def write_shared_state(temperature, humidity, feed_weight, water_level, threshol
         "humidity": humidity,
         "feed_weight": feed_weight,
         "feed_percent": feed_percent,          # hopper-capacity % (low-feed alert basis, unchanged)
+        "feed_capacity_grams": get_feed_capacity(), 
         "feeding_progress": last_feeding_progress,  # per-feeding target % (e.g. 100g = 100%)
         "water_level": water_level,
         "feed_low_threshold": thresholds.get("feedLow", 20),
@@ -920,7 +956,7 @@ def main():
         while True:
 
             # Fast sensors: read every loop 
-            instant_grams = read_grams()
+            instant_grams = read_grams(capacity=get_feed_capacity())
             feed_weight = instant_grams
             water_level = read_water_level()
 

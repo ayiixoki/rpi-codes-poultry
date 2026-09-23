@@ -15,7 +15,7 @@ DEFAULT_HUM_MIN = 50
 DEFAULT_HUM_MAX = 70
 
 # HX711 Calibration
-HX711_OFFSET = -17369
+HX711_OFFSET = 49245
 HX711_SCALE = 412.65
 GRAMS_PER_SECOND = 5
 
@@ -32,9 +32,10 @@ SCHEDULE_FEED_GRAMS = 200          # default per-schedule dispense amount (2x/da
 DISPENSE_STAGE_INTERVAL_SECONDS = 3  # pause between feed servo closing and water servo opening
 
 WATER_NORMAL_CONFIRM_READS = 3      # consecutive "normal" float reads required before closing water valve
-WATER_DISPENSE_TIMEOUT_SECONDS = 180  # safety cutoff if float sensor never reports "normal"
-WATER_DISPENSE_TIMEOUT_MANUAL_SECONDS = 50  # manual dispense safety cutoff
-WATER_EXTRA_FILL_TIME = 20  #seconds to keep the water pump running after the water level sensor reads "normal" to ensure the water is topped up
+WATER_DISPENSE_TIMEOUT_SECONDS = 300  # safety cutoff if float sensor never reports "normal"
+WATER_DISPENSE_TIMEOUT_MANUAL_SECONDS = 240  # manual dispense safety cutoff
+WATER_EXTRA_FILL_TIME = 30 #seconds to keep the water pump running after the water level sensor reads "normal" to ensure the water is topped up
+WATER_HARD_CAP_SECONDS = 180  # stop and assume "normal" after this long, sensor is too slow to trust beyond it
 
 FEED_HYSTERESIS_PERCENT = 5
 

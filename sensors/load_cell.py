@@ -107,11 +107,10 @@ def read_weight(offset, scale):
 _last_valid_grams = None
 _pending_value = None
 _pending_count = 0
-MAX_PLAUSIBLE_DELTA_G = 100       # single-reading jump considered "suspicious"
-CONFIRM_READS_REQUIRED = 1        # how many consistent readings needed to accept a big jump
-DEBUG_GRAMS = True                # set to False to silence the debug print
+MAX_PLAUSIBLE_DELTA_G = 100
+CONFIRM_READS_REQUIRED = 1
 
-def read_grams(offset=None, scale=None, samples=15, trust_reading=False):
+def read_grams(offset=None, scale=None, samples=15, trust_reading=False, capacity=None):
     global _last_valid_grams, _pending_value, _pending_count
     if offset is None:
         offset = get_offset()
@@ -122,13 +121,13 @@ def read_grams(offset=None, scale=None, samples=15, trust_reading=False):
     if raw is None:
         return _last_valid_grams
 
-    # Clamp to [0, FEED_CAPACITY_GRAMS] - the feeder physically cannot hold
-    # more than its capacity, so any reading above that is noise, not real
-    # feed. This keeps LCD/app percentage displays from exceeding 100%.
+    # Use the live, user-configured hopper capacity when the caller passes
+    # one (main.py always should); only fall back to config.FEED_CAPACITY_GRAMS
+    # for standalone/manual runs of this file.
+    cap = capacity if capacity is not None else config.FEED_CAPACITY_GRAMS
+
     real_grams = round((raw - offset) / scale, 1)
-    if DEBUG_GRAMS:
-        print(f"[LOADCELL] raw={raw:.0f} offset={offset:.0f} scale={scale} real_grams={real_grams}g (cap={config.FEED_CAPACITY_GRAMS}g)")
-    weight = max(0.0, min(config.FEED_CAPACITY_GRAMS, real_grams))
+    weight = max(0.0, min(cap, real_grams))
 
     if trust_reading:
         _last_valid_grams = weight
@@ -149,13 +148,11 @@ def read_grams(offset=None, scale=None, samples=15, trust_reading=False):
         _pending_count = 1
 
     if _pending_count >= CONFIRM_READS_REQUIRED:
-        print(f"Confirmed new feed level: {weight}g")
         _last_valid_grams = weight
         _pending_value = None
         _pending_count = 0
         return weight
 
-    print(f" Rejected noisy feed reading: {weight}g (last valid: {_last_valid_grams}g)")
     return _last_valid_grams
 
 # ---- Stabilized reading for display / Firebase / alerts ----

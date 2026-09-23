@@ -11,8 +11,9 @@ SHARED_STATE_FILE = "shared_state.json"
 LCD_COMMANDS_FILE = "lcd_commands.json"
 POLL_MS = 50  # how often the dashboard refreshes from shared_state.json
 
-# TODO: actual max capacity (in grams) of your feed bowl.
-# The feed card now displays a percentage of this value instead of raw grams.
+# Fallback only, used until the first shared_state.json read arrives with
+# the live feed_capacity_grams value (set by the user in the app's
+# Settings screen). Not the source of truth.
 FEED_CAPACITY_GRAMS = 200
 
 
@@ -49,6 +50,13 @@ class PoultryDashboard(tk.Tk):
         self.attributes("-fullscreen", True)
         self.configure(bg=BG_DARK)
         self.bind("<Escape>", lambda e: self.attributes("-fullscreen", False))
+
+        # Live hopper capacity, updated from shared_state.json every poll.
+        # Must be set BEFORE _poll_state() runs, since _poll_state can call
+        # _update_display() immediately on the first call if shared_state.json
+        # already exists (main.py is normally already running by the time
+        # this dashboard starts).
+        self.feed_capacity_grams = FEED_CAPACITY_GRAMS
 
         self.font_big = tkfont.Font(family="DejaVu Sans", size=30, weight="bold")
         self.font_med = tkfont.Font(family="DejaVu Sans", size=18, weight="bold")
@@ -231,9 +239,9 @@ class PoultryDashboard(tk.Tk):
         )
         feed_title.pack(fill="x")
 
-        # Manual dispense now steps in 10% increments of the per-feeding
-        # target (config.SCHEDULE_FEED_GRAMS, e.g. 100g = 100%) instead of
-        # raw grams, matching the percentage shown everywhere else.
+        # Manual dispense steps in 10% increments of the LIVE hopper
+        # capacity (self.feed_capacity_grams, kept in sync from
+        # shared_state.json), not a fixed per-feeding target.
         self.custom_percent = tk.IntVar(value=10)
         self.custom_percent_display = tk.StringVar(value="10 %")
 
@@ -241,7 +249,7 @@ class PoultryDashboard(tk.Tk):
         custom_frame.pack(fill="x", pady=(6, 0))
 
         custom_title = tk.Label(
-            custom_frame, text="Feed Amount (% of feeding target):", font=self.font_small,
+            custom_frame, text="Feed Amount (% of hopper capacity):", font=self.font_small,
             bg=BG_DARK, fg=TEXT_MAIN, anchor="w"
         )
         custom_title.pack(fill="x")
@@ -336,10 +344,9 @@ class PoultryDashboard(tk.Tk):
         state_label.config(text="ON" if is_on else "OFF", bg=bg, fg=fg)
 
     def _adjust_custom_percent(self, delta):
-        # Steps 10 -> 20 -> ... -> 100%. 100% caps at exactly one full
-        # feeding target (config.SCHEDULE_FEED_GRAMS) - manual dispenses
-        # from this dashboard can't exceed a single feeding's worth in
-        # one press.
+        # Steps 10 -> 20 -> ... -> 100%. 100% caps at the full live
+        # hopper capacity (self.feed_capacity_grams) - manual dispenses
+        # from this dashboard can't exceed the full hopper in one press.
         MIN_PERCENT = 10
         MAX_PERCENT = 100
         new_value = self.custom_percent.get() + delta
@@ -351,10 +358,10 @@ class PoultryDashboard(tk.Tk):
         self.destroy()
 
     def _dispense_feed(self, percent):
-        # The Pi's dispense logic (main.py / lcd_command_watcher) still
-        # works in grams, so convert the percentage back to grams here,
-        # right at the boundary, before writing the command file.
-        grams = round((percent / 100) * config.SCHEDULE_FEED_GRAMS)
+        # Convert percent to grams using the LIVE hopper capacity from
+        # shared_state.json (set by the user in the app's Settings screen),
+        # not a stale config default.
+        grams = round((percent / 100) * self.feed_capacity_grams)
 
         # Instant visual feedback so the press feels responsive even before
         # the Pi confirms via shared_state.json.
@@ -382,7 +389,6 @@ class PoultryDashboard(tk.Tk):
             "water_dispense": {"requested": water}
         }
         try:
-            
             tmp_path = LCD_COMMANDS_FILE + ".tmp"
             with open(tmp_path, "w") as f:
                 json.dump(command, f)
@@ -448,10 +454,11 @@ class PoultryDashboard(tk.Tk):
         else:
             self._set_badge(self.hum_badge, "--", "normal")
 
+        self.feed_capacity_grams = state.get("feed_capacity_grams", self.feed_capacity_grams)
+
         # Feed level: use the percentage the Pi already computed
-        # (feed_percent, based on config.FEED_CAPACITY_GRAMS) rather than
-        # recalculating it here from raw grams with a second, separate
-        # capacity constant.
+        # (feed_percent, based on the live hopper capacity) rather than
+        # recalculating it here with a second, separate capacity constant.
         feed_pct = state.get("feed_percent")
         if feed_pct is not None:
             feed_pct = max(0, min(100, feed_pct))
