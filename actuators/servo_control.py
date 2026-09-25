@@ -11,7 +11,7 @@ def setup_servos():
     GPIO.setup(WATER_SERVO_PIN, GPIO.OUT)
 
     global feed_pwm, water_pwm
-    feed_pwm = GPIO.PWM(FEED_SERVO_PIN, 50)   # 50Hz PWM
+    feed_pwm = GPIO.PWM(FEED_SERVO_PIN, 50)   
     water_pwm = GPIO.PWM(WATER_SERVO_PIN, 50)
     feed_pwm.start(0)
     water_pwm.start(0)

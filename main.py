@@ -1,12 +1,13 @@
 import time
 import json
+import statistics
 import threading
 from datetime import datetime, timedelta
 import RPi.GPIO as GPIO
 
 from firebase_service import (
     init_firebase, push_sensor_data, get_thresholds,
-    get_schedules, update_actuator_state, write_log, send_alert_push
+    get_schedules, update_actuator_state, write_log, send_alert_push,
     update_feed_alert_state
 )
 from sensors.dht22 import read_dht22
@@ -46,7 +47,8 @@ latest_water_level = None
 
 SCHEDULE_CACHE_FILE = "schedule_cache.json"
 THRESHOLD_CACHE_FILE = "threshold_cache.json"
-ALERT_STATE_FILE = "alert_state_cache.json" 
+ALERT_STATE_FILE = "alert_state_cache.json"
+DISPENSE_RATE_CACHE_FILE = "dispense_rate_cache.json"
 
 THRESHOLD_REFRESH_INTERVAL = 30  
 threshold_refresh_loops = THRESHOLD_REFRESH_INTERVAL // config.FAST_READ_INTERVAL
@@ -60,11 +62,26 @@ cached_schedules = None
 fired_schedules_this_minute = set()
 last_checked_minute = None
 
+# Alert active flags
 feed_low_active = False
 water_low_active = False     
 temp_high_active = False
 temp_low_active = False
 hum_high_active = False
+
+# Alert debounce counters (consecutive confirming / clearing readings).
+# Feed advances every fast loop (real ~1/sec reading). Temp/humidity only
+# advance when a genuinely new DHT22 sample was taken (see new_slow_reading
+# in main()), otherwise 5 "readings" would all just be the same cached
+# value repeated within one second and debounce would be meaningless.
+feed_low_pending = 0
+feed_clear_pending = 0
+temp_low_pending = 0
+temp_low_clear_pending = 0
+temp_high_pending = 0
+temp_high_clear_pending = 0
+hum_high_pending = 0
+hum_high_clear_pending = 0
 
 exhaust_fan_last_on_time = None
 
@@ -226,56 +243,137 @@ def control_environment(temperature, humidity, thresholds):
         log_actuator("Exhaust Fan", "OFF", reason)
         print(f"Exhaust Fan OFF ({temperature:.1f}°C, {humidity}%)")
 
+#  Dispense rate memory (feeds the bulk phase estimate) 
+def _load_avg_dispense_rate():
+    """Grams/second the feeder actually delivers, learned from past
+    dispenses. Falls back to config.GRAMS_PER_SECOND until we have data."""
+    try:
+        with open(DISPENSE_RATE_CACHE_FILE, "r") as f:
+            data = json.load(f)
+        rate = data.get("avg_rate_gps")
+        if rate and rate > 0:
+            return rate
+    except Exception:
+        pass
+    return getattr(config, "GRAMS_PER_SECOND", 5)
+
+
+def _save_avg_dispense_rate(new_rate):
+    """Blend the newly measured rate into the persisted average so one
+    noisy dispense doesn't swing the bulk-phase estimate wildly, but it
+    still converges toward the real rate after a handful of feedings."""
+    try:
+        old_rate = _load_avg_dispense_rate()
+        blended = round((old_rate * 0.7) + (new_rate * 0.3), 2)
+        with open(DISPENSE_RATE_CACHE_FILE, "w") as f:
+            json.dump({
+                "avg_rate_gps": blended,
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }, f)
+    except Exception as e:
+        print(f"Dispense rate cache write failed: {e}")
+
+
+def _read_settled_grams(capacity, samples_sets=3, delay=0.15):
+    """A few spaced weight readings, median-filtered. Reduces (doesn't
+    eliminate — a bird standing there the whole time will still fool it)
+    the chance a single instant reading is thrown off by a chicken on
+    or near the plate."""
+    readings = []
+    for _ in range(samples_sets):
+        val = read_grams(samples=8, trust_reading=True, capacity=capacity)
+        if val is not None:
+            readings.append(val)
+        time.sleep(delay)
+    if not readings:
+        return None
+    return round(statistics.median(readings), 1)
+
+
 def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None):
     global is_dispensing_feed, last_feeding_progress
     if is_dispensing_feed:
         return
 
-    current_weight = latest_feed_weight if latest_feed_weight is not None else read_grams(capacity=get_feed_capacity())
+    capacity = get_feed_capacity()
+    current_weight = latest_feed_weight if latest_feed_weight is not None else read_grams(capacity=capacity)
     start_weight = current_weight if current_weight is not None else 0
 
     # target_grams is always the ABSOLUTE amount that should be on the plate
     # when dispensing finishes — independent of what's already there.
-    target_grams = min(target_grams, get_feed_capacity())
-
+    target_grams = min(target_grams, capacity)
+    
     if start_weight >= target_grams:
-        print(f"Plate already at {start_weight}g (capacity {config.FEED_CAPACITY_GRAMS}g) - skipping, no dispense needed")
+        print(f"Plate already at {start_weight}g (capacity {capacity}g) - skipping, no dispense needed")
         return
 
     amount_requested = target_grams - start_weight
 
+    min_rate = getattr(config, "DISPENSE_MIN_RATE_GPS", 0.3)
+    avg_rate_for_buffer = max(min_rate, _load_avg_dispense_rate())
+    settle_seconds = getattr(config, "DISPENSE_SETTLE_SECONDS", 0.6)  # time feed keeps falling after close, in seconds — measure this once by eye
+    dynamic_buffer = max(config.DISPENSE_OVERSHOOT_BUFFER_GRAMS, avg_rate_for_buffer * settle_seconds)
+    stop_early_at = target_grams - dynamic_buffer
+
     is_dispensing_feed = True
+    dispense_start = time.time()
     try:
-        stop_early_at = target_grams - config.DISPENSE_OVERSHOOT_BUFFER_GRAMS
-        print(f"Dispensing feed (adaptive): {start_weight}g -> target {target_grams}g (adding {amount_requested}g, closing early at {stop_early_at}g)")
+        print(f"Dispensing feed: {start_weight}g -> target {target_grams}g (adding {amount_requested}g, closing early at {stop_early_at}g)")
         update_actuator_state("feedServo", True)
 
         timeout = time.time() + config.FEED_DISPENSE_TIMEOUT_SECONDS
         current_weight = start_weight
-        measured_rate = None  # grams per second, learned from actual pulses
+        measured_rate = None
+        total_open_seconds = 0.0
 
-        # First pulse is a short PROBE - its only job is to measure this
-        # feeder's real flow rate so every pulse after it can be sized
-        # exactly, instead of relying on fixed time buckets.
-        PROBE_SECONDS = 0.08
+        # ---------- Bulk phase ----------
+        bulk_fraction = getattr(config, "DISPENSE_BULK_FRACTION", 0.2)
+        bulk_max_seconds = getattr(config, "DISPENSE_BULK_MAX_SECONDS", 5)
+
+        avg_rate = max(min_rate, _load_avg_dispense_rate())
+        bulk_grams_target = amount_requested * bulk_fraction
+        bulk_seconds = min(bulk_max_seconds, bulk_grams_target / avg_rate)
+
+        if bulk_seconds > 0.1:
+            print(f"  Bulk phase: opening {bulk_seconds:.2f}s (~{bulk_grams_target:.0f}g @ {avg_rate:.1f}g/s est.)")
+            bulk_pulse_start = time.time()
+            open_feed()
+            time.sleep(bulk_seconds)
+            close_feed()
+            actual_bulk_time = time.time() - bulk_pulse_start
+            total_open_seconds += actual_bulk_time
+            time.sleep(config.SERVO_CLOSE_LATENCY_SECONDS)
+
+            settled = _read_settled_grams(capacity)
+            if settled is not None:
+                current_weight = settled
+                bulk_dispensed = max(0.0, current_weight - start_weight)
+                if actual_bulk_time > 0 and bulk_dispensed > 0:
+                    measured_rate = bulk_dispensed / actual_bulk_time
+                print(f"  Bulk result: +{bulk_dispensed:.1f}g in {actual_bulk_time:.2f}s"
+                      + (f" (~{measured_rate:.1f}g/s)" if measured_rate else " (rate unclear, keeping estimate)"))
+
+        # ---------- Adaptive fine-tune phase ----------
+        # Small self-correcting pulses to land on the exact gram target,
+        # seeded with the rate just measured from the bulk phase (a real,
+        # multi-second measurement) instead of a noisy 0.08s guess.
+        if measured_rate is None:
+            measured_rate = avg_rate
 
         while time.time() < timeout and current_weight < stop_early_at:
             remaining = stop_early_at - current_weight
 
-            if measured_rate is None:
-                pulse_seconds = PROBE_SECONDS
+            if remaining <= 3:
+                correction = 0.3   # final fine-tuning pulses: tiny bites
+            elif remaining <= 10:
+                correction = 0.5
             else:
-                # Exact time needed for the remaining grams at the measured
-                # rate. Correction factor shrinks the closer we get, so
-                # later pulses take smaller, more cautious bites instead of
-                # repeating the same aggressive guess and overshooting.
-                if remaining <= 3:
-                    correction = 0.3   # final fine-tuning pulses: tiny bites
-                elif remaining <= 10:       
-                    correction = 0.5
-                else:
-                    correction = 0.3
-                pulse_seconds = min(1.0, max(0.03, (remaining / measured_rate) * correction))
+                # Higher than the old 0.08 default: measured_rate now comes
+                # from a multi-second bulk measurement, not a 0.08s probe,
+                # so it's trustworthy enough to take bigger corrective bites.
+                correction = 0.4
+
+            pulse_seconds = min(1.0, max(0.03, (remaining / measured_rate) * correction))
 
             before = current_weight
             pulse_start = time.time()
@@ -285,9 +383,10 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None):
             close_feed()
 
             actual_pulse_time = time.time() - pulse_start
+            total_open_seconds += actual_pulse_time
             time.sleep(config.SERVO_CLOSE_LATENCY_SECONDS)  # let settling/momentum finish before measuring
 
-            current_weight = read_grams(samples=8, trust_reading=True, capacity=get_feed_capacity())
+            current_weight = read_grams(samples=8, trust_reading=True, capacity=capacity)
             if current_weight is None:
                 current_weight = before
 
@@ -298,8 +397,7 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None):
                 measured_rate = dispensed_this_pulse / actual_pulse_time
 
             print(f"  Pulse {pulse_seconds:.2f}s -> +{dispensed_this_pulse:.1f}g, plate now {current_weight}g "
-                  f"(rate ~{measured_rate:.1f}g/s)" if measured_rate else
-                  f"  Pulse {pulse_seconds:.2f}s -> +{dispensed_this_pulse:.1f}g, plate now {current_weight}g")
+                  f"(rate ~{measured_rate:.1f}g/s)")
 
             if current_weight >= stop_early_at:
                 break
@@ -309,13 +407,18 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None):
         if not reached_target and time.time() >= timeout:
             print(f"Feed fail-safe: {target_grams}g not reached after {config.FEED_DISPENSE_TIMEOUT_SECONDS}s. Check hopper, servo and load cell.")
 
-        final_weight = read_grams(samples=15, trust_reading=True, capacity=get_feed_capacity())
+        final_weight = _read_settled_grams(capacity)
         if final_weight is None:
             final_weight = current_weight
         reset_stable_grams(final_weight)
 
         dispensed = max(0.0, round(final_weight - start_weight, 1))
         log_feed(dispensed, triggered_by)
+
+        # Learn from the whole dispense (bulk + fine-tune combined) so the
+        # bulk-phase estimate keeps improving over successive feedings.
+        if total_open_seconds > 0 and dispensed > 0:
+            _save_avg_dispense_rate(dispensed / total_open_seconds)
 
         feeding_percent = round(min(100, (dispensed / amount_requested) * 100))
         last_feeding_progress = {
@@ -680,46 +783,20 @@ def lcd_command_watcher():
             print(f"LCD command watcher error: {e}")
         time.sleep(poll_interval)
 
-#  Alert Checker
-# ============================================================
-# PATCH: check_alerts() with hysteresis added to the CLEAR side
-# of each condition, so a reading that hovers right at the
-# threshold doesn't flap active -> clear -> active repeatedly.
-#
-# This REPLACES your existing check_alerts() function entirely.
-#
-# Requires one new config value (add to config.py if it's not
-# already there):
-#
-#     FEED_HYSTERESIS_PERCENT = 5   # feed must recover 5% above
-#                                    # the low threshold to clear
-#
-# TEMP_HYSTERESIS and HUM_HYSTERESIS are reused from your
-# existing control_environment() logic - no new constants needed
-# for those two.
-# ============================================================
-
-# ============================================================
-# PATCH: persist alert-active flags so a script restart doesn't
-# re-fire "temperature low" / "feed low" / etc. notifications
-# that are already active.
-#
-# Integrate into main.py as follows:
-#   1. Add ALERT_STATE_FILE + load_alert_state()/save_alert_state()
-#      near your other *_CACHE_FILE constants.
-#   2. Call load_alert_state() once, near the top of main(),
-#      right after init_firebase().
-#   3. Call save_alert_state() at the end of check_alerts()
-#      (or right after any flag changes inside it).
-# ============================================================
-
-ALERT_STATE_FILE = "alert_state_cache.json"
+#  Alert State Persistence 
+# Restores both the active-alert flags AND the in-progress debounce
+# counters, so a script restart doesn't lose partial debounce progress or
+# re-fire notifications that are already active.
 
 def load_alert_state():
-    """Restore active-alert flags from disk on startup, so a restart
-    doesn't think every ongoing problem is brand new."""
+    """Restore alert state from disk on startup, so a restart doesn't
+    think every ongoing problem (or in-progress debounce count) is new."""
     global feed_low_active, water_low_active
     global temp_high_active, temp_low_active, hum_high_active
+    global feed_low_pending, feed_clear_pending
+    global temp_low_pending, temp_low_clear_pending
+    global temp_high_pending, temp_high_clear_pending
+    global hum_high_pending, hum_high_clear_pending
 
     try:
         with open(ALERT_STATE_FILE, "r") as f:
@@ -729,24 +806,39 @@ def load_alert_state():
         temp_high_active = state.get("temp_high_active", False)
         temp_low_active = state.get("temp_low_active", False)
         hum_high_active = state.get("hum_high_active", False)
+        feed_low_pending = state.get("feed_low_pending", 0)
+        feed_clear_pending = state.get("feed_clear_pending", 0)
+        temp_low_pending = state.get("temp_low_pending", 0)
+        temp_low_clear_pending = state.get("temp_low_clear_pending", 0)
+        temp_high_pending = state.get("temp_high_pending", 0)
+        temp_high_clear_pending = state.get("temp_high_clear_pending", 0)
+        hum_high_pending = state.get("hum_high_pending", 0)
+        hum_high_clear_pending = state.get("hum_high_clear_pending", 0)
         print(f"Restored alert state from disk: {state}")
     except Exception:
-        # No cache yet (first run) - flags stay at their False defaults,
+        # No cache yet (first run) - flags/counters stay at their defaults,
         # which is correct: on a truly fresh start we don't know of any
-        # active problem yet, so the first real check_alerts() call will
-        # set + notify normally if one exists.
+        # active problem yet.
         print("No alert state cache found - starting fresh")
 
 
 def save_alert_state():
-    """Call this after check_alerts() runs (or whenever a flag changes)
-    so an unexpected restart can restore exactly what was active."""
+    """Call this after check_alerts() runs so an unexpected restart can
+    restore exactly what was active (and how far a debounce had progressed)."""
     state = {
         "feed_low_active": feed_low_active,
         "water_low_active": water_low_active,
         "temp_high_active": temp_high_active,
         "temp_low_active": temp_low_active,
         "hum_high_active": hum_high_active,
+        "feed_low_pending": feed_low_pending,
+        "feed_clear_pending": feed_clear_pending,
+        "temp_low_pending": temp_low_pending,
+        "temp_low_clear_pending": temp_low_clear_pending,
+        "temp_high_pending": temp_high_pending,
+        "temp_high_clear_pending": temp_high_clear_pending,
+        "hum_high_pending": hum_high_pending,
+        "hum_high_clear_pending": hum_high_clear_pending,
     }
     try:
         with open(ALERT_STATE_FILE, "w") as f:
@@ -755,116 +847,162 @@ def save_alert_state():
         print(f"Alert state cache write failed: {e}")
 
 
-# ------------------------------------------------------------
-# In main(), right after init_firebase():
-#
-#     init_firebase()
-#     load_alert_state()          # <-- ADD THIS
-#     setup_relay()
-#     ...
-#
-# In the main loop, right after check_alerts(...) is called:
-#
-#     check_alerts(feed_weight, water_level, temperature, humidity, thresholds)
-#     save_alert_state()          # <-- ADD THIS
-# ------------------------------------------------------------
-
-
-def check_alerts(feed_weight, water_level, temperature, humidity, thresholds):
+def check_alerts(feed_weight, water_level, temperature, humidity, thresholds, new_slow_reading=False):
     global feed_low_active, water_low_active
     global temp_high_active, temp_low_active, hum_high_active
+    global feed_low_pending, feed_clear_pending
+    global temp_low_pending, temp_low_clear_pending
+    global temp_high_pending, temp_high_clear_pending
+    global hum_high_pending, hum_high_clear_pending
 
     temp_max = thresholds.get("tempMax", config.DEFAULT_TEMP_MAX)
     temp_min = thresholds.get("tempMin", config.DEFAULT_TEMP_MIN)
     hum_max = thresholds.get("humMax", config.DEFAULT_HUM_MAX)
 
-    # -------------------------
-    # Temperature
-    # -------------------------
-    if temperature is not None:
-        # High temp: fires the instant it crosses above temp_max, but only
-        # clears once it drops back below (temp_max - hysteresis) - so a
-        # reading bouncing right at temp_max won't fire twice in a row.
-        if temperature > temp_max and not temp_high_active:
-            temp_high_active = True
-            log_alert("Temperature High", f"{temperature:.1f}°C (above {temp_max}°C)")
-            db.reference("/notifications").push({
-                "type": "highTemp",
-                "value": temperature,
-                "threshold": temp_max,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
-            send_alert_push("High Temperature Alert", f"Temperature reached {temperature:.1f}°C")
-        elif temperature <= (temp_max - config.TEMP_HYSTERESIS) and temp_high_active:
-            temp_high_active = False
-
-        if temperature < temp_min and not temp_low_active:
-            temp_low_active = True
-            log_alert("Temperature Low", f"{temperature:.1f}°C (below {temp_min}°C)")
-            db.reference("/notifications").push({
-                "type": "lowTemp",
-                "value": temperature,
-                "threshold": temp_min,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
-            send_alert_push("Low Temperature Alert", f"Temperature dropped to {temperature:.1f}°C")
-        elif temperature >= (temp_min + config.TEMP_HYSTERESIS) and temp_low_active:
-            temp_low_active = False
+    temp_confirm = getattr(config, "TEMP_ALERT_CONFIRM_READS", 5)
+    hum_confirm = getattr(config, "HUM_ALERT_CONFIRM_READS", 5)
+    feed_confirm = getattr(config, "FEED_ALERT_CONFIRM_READS", 5)
 
     # -------------------------
-    # Humidity
+    # Temperature / Humidity — counters only advance on an actual new DHT22
+    # sample (it only refreshes every SLOW_READ_INTERVAL seconds), so a
+    # single noisy reading can't fake 5 "consistent readings" just by being
+    # re-evaluated on repeated fast-loop iterations.
     # -------------------------
-    if humidity is not None:
-        if humidity > hum_max and not hum_high_active:
-            hum_high_active = True
-            log_alert("Humidity High", f"{humidity:.1f}% (above {hum_max}%), exhaust fan ON")
-            db.reference("/notifications").push({
-                "type": "humidityHigh",
-                "value": humidity,
-                "threshold": hum_max,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
-            send_alert_push("High Humidity Alert", f"Humidity reached {humidity:.1f}% — exhaust fan ON")
-        elif humidity <= (hum_max - config.HUM_HYSTERESIS) and hum_high_active:
-            hum_high_active = False
+    if new_slow_reading and temperature is not None:
+
+        # High temp
+        if temperature > temp_max:
+            temp_high_clear_pending = 0
+            if not temp_high_active:
+                temp_high_pending += 1
+                if temp_high_pending >= temp_confirm:
+                    temp_high_active = True
+                    temp_high_pending = 0
+                    log_alert("Temperature High", f"{temperature:.1f}°C (above {temp_max}°C)")
+                    db.reference("/notifications").push({
+                        "type": "highTemp",
+                        "value": temperature,
+                        "threshold": temp_max,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    send_alert_push("High Temperature Alert", f"Temperature reached {temperature:.1f}°C")
+        else:
+            temp_high_pending = 0
+            if temp_high_active and temperature <= (temp_max - config.TEMP_HYSTERESIS):
+                temp_high_clear_pending += 1
+                if temp_high_clear_pending >= temp_confirm:
+                    temp_high_active = False
+                    temp_high_clear_pending = 0
+            else:
+                temp_high_clear_pending = 0
+
+        # Low temp
+        if temperature < temp_min:
+            temp_low_clear_pending = 0
+            if not temp_low_active:
+                temp_low_pending += 1
+                if temp_low_pending >= temp_confirm:
+                    temp_low_active = True
+                    temp_low_pending = 0
+                    log_alert("Temperature Low", f"{temperature:.1f}°C (below {temp_min}°C)")
+                    db.reference("/notifications").push({
+                        "type": "lowTemp",
+                        "value": temperature,
+                        "threshold": temp_min,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    send_alert_push("Low Temperature Alert", f"Temperature dropped to {temperature:.1f}°C")
+        else:
+            temp_low_pending = 0
+            if temp_low_active and temperature >= (temp_min + config.TEMP_HYSTERESIS):
+                temp_low_clear_pending += 1
+                if temp_low_clear_pending >= temp_confirm:
+                    temp_low_active = False
+                    temp_low_clear_pending = 0
+            else:
+                temp_low_clear_pending = 0
+
+    if new_slow_reading and humidity is not None:
+        if humidity > hum_max:
+            hum_high_clear_pending = 0
+            if not hum_high_active:
+                hum_high_pending += 1
+                if hum_high_pending >= hum_confirm:
+                    hum_high_active = True
+                    hum_high_pending = 0
+                    log_alert("Humidity High", f"{humidity:.1f}% (above {hum_max}%), exhaust fan ON")
+                    db.reference("/notifications").push({
+                        "type": "humidityHigh",
+                        "value": humidity,
+                        "threshold": hum_max,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    send_alert_push("High Humidity Alert", f"Humidity reached {humidity:.1f}% — exhaust fan ON")
+        else:
+            hum_high_pending = 0
+            if hum_high_active and humidity <= (hum_max - config.HUM_HYSTERESIS):
+                hum_high_clear_pending += 1
+                if hum_high_clear_pending >= hum_confirm:
+                    hum_high_active = False
+                    hum_high_clear_pending = 0
+            else:
+                hum_high_clear_pending = 0
 
     feed_low_threshold = thresholds.get("feedLow", 20)  # percent
 
     # -------------------------
-    # Feed Level
+    # Feed Level — feed_weight is a real per-second reading, so this
+    # debounces directly against load-cell noise.
     # -------------------------
     if feed_weight is not None:
         feed_percent = (feed_weight / get_feed_capacity()) * 100
         feed_hysteresis = getattr(config, "FEED_HYSTERESIS_PERCENT", 5)
 
-        # Feed became LOW
-        if feed_percent < feed_low_threshold and not feed_low_active:
-            feed_low_active = True
-            log_alert("Low Feed", f"{feed_weight:.0f} g remaining ({feed_percent:.0f}%)")
-            db.reference("/notifications").push({
-                "type": "lowFeed",
-                "value": feed_weight,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
-            send_alert_push(
-                "Low Feed Alert",
-                f"Feed level is low ({feed_percent:.0f}% remaining)"
-            )
-            update_feed_alert_state(True)
-            print(f"Low Feed: {feed_weight:.0f} g ({feed_percent:.0f}%)")
+        # Feed became LOW — requires feed_confirm consecutive low readings
+        # before firing, so a single noisy dip (or a chicken briefly
+        # standing on the load cell) can't trigger a false alert. Once
+        # active, dropping further (18%, 10%, etc.) does NOT fire again.
+        if feed_percent < feed_low_threshold:
+            feed_clear_pending = 0
+            if not feed_low_active:
+                feed_low_pending += 1
+                if feed_low_pending >= feed_confirm:
+                    feed_low_active = True
+                    feed_low_pending = 0
+                    log_alert("Low Feed", f"{feed_weight:.0f} g remaining ({feed_percent:.0f}%)")
+                    db.reference("/notifications").push({
+                        "type": "lowFeed",
+                        "value": feed_weight,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    send_alert_push(
+                        "Low Feed Alert",
+                        f"Feed level is low ({feed_percent:.0f}% remaining)"
+                    )
+                    update_feed_alert_state(True)
+                    print(f"Low Feed: {feed_weight:.0f} g ({feed_percent:.0f}%)")
 
-        # Feed restored - must climb feed_hysteresis % above the threshold
-        # to clear, not just barely tick over it.
-        elif feed_percent >= (feed_low_threshold + feed_hysteresis) and feed_low_active:
-            feed_low_active = False
-            log_alert("Feed Restocked", f"{feed_weight:.0f} g available ({feed_percent:.0f}%)")
-            update_feed_alert_state(False) 
-            print(f"Feed Restocked: {feed_weight:.0f} g ({feed_percent:.0f}%)")
+        # Feed restored — must climb feed_hysteresis% above the threshold
+        # AND hold it for feed_confirm consecutive readings to clear, not
+        # just barely tick over it for one instant.
+        else:
+            feed_low_pending = 0
+            if feed_low_active and feed_percent >= (feed_low_threshold + feed_hysteresis):
+                feed_clear_pending += 1
+                if feed_clear_pending >= feed_confirm:
+                    feed_low_active = False
+                    feed_clear_pending = 0
+                    log_alert("Feed Restocked", f"{feed_weight:.0f} g available ({feed_percent:.0f}%)")
+                    update_feed_alert_state(False)
+                    print(f"Feed Restocked: {feed_weight:.0f} g ({feed_percent:.0f}%)")
+            else:
+                feed_clear_pending = 0
 
     # -------------------------
     # Water Level
     # -------------------------
-    # Left as a direct low/normal check (no hysteresis) - the float
+    # Left as a direct low/normal check (no debounce) - the float
     # sensor is discrete/categorical rather than a noisy continuous
     # reading, so there's no threshold edge for it to flap around.
     current_low = str(water_level).lower() == "low"
@@ -891,8 +1029,8 @@ def check_alerts(feed_weight, water_level, temperature, humidity, thresholds):
 
         print(" Water Restored")
 
-    # Persist active-flag state so a restart doesn't re-fire alerts
-    # that are already active (see alert_state_patch.py).
+    # Persist active-flag + debounce-counter state so a restart doesn't
+    # re-fire alerts that are already active, or lose in-progress debounce.
     save_alert_state()
 
 # Shared State Writer (for LCD dashboard) 
@@ -970,12 +1108,15 @@ def main():
                 latest_feed_weight = instant_grams
             latest_water_level = water_level
 
-            # Slow sensor
+            # Slow sensor — only True this iteration if a fresh DHT22 sample
+            # was actually taken (used to gate the temp/humidity alert debounce).
+            new_slow_reading = False
             if loop_count % slow_read_loops == 0:
                 temperature, humidity = read_dht22()
                 if temperature is not None:
                     last_temperature = temperature
                     last_humidity = humidity
+                    new_slow_reading = True
 
             temperature = last_temperature
             humidity = last_humidity
@@ -1014,17 +1155,14 @@ def main():
             if temperature is not None:
                 control_environment(temperature, humidity, thresholds)
 
-            # Check alerts every fast loop 
-            check_alerts(feed_weight, water_level, temperature, humidity, thresholds)
+            # Check alerts every fast loop (debounce logic inside gates
+            # temp/humidity on new_slow_reading; feed debounces every loop)
+            check_alerts(feed_weight, water_level, temperature, humidity, thresholds, new_slow_reading=new_slow_reading)
 
-            # Persist active-flag state so a restart doesn't re-fire alerts
-            # that are already active (see alert_state_patch.py).
-            save_alert_state()
-
-            # Publish the hysteresis-aware flag itself, so the app and LCD show
+            # Publish the debounced flag itself, so the app and LCD show
             # the SAME "low" state as this function just computed, instead of
             # each recomputing feed_percent < threshold on their own with no
-            # hysteresis memory.
+            # debounce memory.
             try:
                 db.reference('/sensor_data').update({'feed_low_active': feed_low_active})
             except Exception as e:

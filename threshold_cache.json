@@ -1,1 +1,1 @@
-{"dispenseSeconds": 10, "feedCapacityGrams": 800, "feedLow": 19.9832349537037, "humMax": 70.02349537037037, "humMin": 50, "manualDispenseGrams": 50, "manualDispensePercent": 10, "tempMax": 34.00584490740741, "tempMin": 30.225225225225227, "waterLow": 22.39375}
+{"dispenseSeconds": 10, "feedCapacityGrams": 400, "feedLow": 17.82920420420418, "humMax": 70.14264264264266, "humMin": 50, "manualDispenseGrams": 50, "manualDispensePercent": 5, "tempMax": 34.00584490740741, "tempMin": 30.03518518518518, "waterLow": 22.39375}
