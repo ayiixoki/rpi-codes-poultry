@@ -33,11 +33,15 @@ def log_system(message):
     _write("info", "System", message)
 
 
-def log_feed(amount, triggered_by):
+def log_feed(amount, triggered_by, percent=None):
+    if percent is None:
+        message = f"{amount} g ({triggered_by})"
+    else:
+        message = f"{amount} g ({percent}%) ({triggered_by})"
     _write(
         "feeding",
         "Feed Dispensed",
-        f"{amount} g ({triggered_by})",
+        message,
     )
 
 

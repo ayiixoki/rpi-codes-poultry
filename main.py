@@ -413,7 +413,6 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None):
         reset_stable_grams(final_weight)
 
         dispensed = max(0.0, round(final_weight - start_weight, 1))
-        log_feed(dispensed, triggered_by)
 
         # Learn from the whole dispense (bulk + fine-tune combined) so the
         # bulk-phase estimate keeps improving over successive feedings.
@@ -421,6 +420,8 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None):
             _save_avg_dispense_rate(dispensed / total_open_seconds)
 
         feeding_percent = round(min(100, (dispensed / amount_requested) * 100))
+        log_feed(dispensed, triggered_by, percent=feeding_percent)
+
         last_feeding_progress = {
             "percent": feeding_percent,
             "grams": dispensed,
@@ -428,6 +429,26 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None):
             "triggered_by": triggered_by,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
+
+        # ---------- Feed Restocked (only checked right here, after a real
+        # dispense settles) ----------
+        # check_alerts() only ever SETS feed_low_active True now; clearing
+        # happens only here, against a clean settled post-dispense reading,
+        # so background load-cell noise can never flap the "restocked"
+        # notification on its own.
+        global feed_low_active, feed_clear_pending
+        if feed_low_active:
+            capacity_for_alert = get_feed_capacity()
+            final_percent = (final_weight / capacity_for_alert) * 100 if capacity_for_alert else 0
+            feed_low_threshold = (cached_thresholds or {}).get("feedLow", config.DEFAULT_FEED_LOW)
+            feed_hysteresis = getattr(config, "FEED_HYSTERESIS_PERCENT", 5)
+            if final_percent >= (feed_low_threshold + feed_hysteresis):
+                feed_low_active = False
+                feed_clear_pending = 0
+                log_alert("Feed Restocked", f"{final_weight:.0f} g available ({final_percent:.0f}%)")
+                update_feed_alert_state(False)
+                save_alert_state()
+                print(f"Feed Restocked: {final_weight:.0f} g ({final_percent:.0f}%)")
 
         try:
             db.reference("/notifications").push({
@@ -454,6 +475,16 @@ def dispense_water(triggered_by="schedule"):
     current_level = latest_water_level if latest_water_level is not None else read_water_level()
     if current_level in ("normal", "full"):
         print(f"Water already '{current_level}' - skipping, no dispense needed")
+        try:
+            db.reference("/sensor_data").update({
+                "last_water_action": {
+                    "result": "skipped_already_normal",
+                    "triggered_by": triggered_by,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            })
+        except Exception as e:
+            print(f"Firebase write failed after water skip: {e}")
         return
 
     is_dispensing_water = True
@@ -462,7 +493,6 @@ def dispense_water(triggered_by="schedule"):
         update_actuator_state("waterServo", True)
         open_water()
 
-        # Manual and LCD dispenses use a shorter safety cutoff than scheduled ones
         timeout_seconds = (
             config.WATER_DISPENSE_TIMEOUT_MANUAL_SECONDS
             if triggered_by in ("manual", "lcd")
@@ -489,15 +519,23 @@ def dispense_water(triggered_by="schedule"):
         close_water()
         update_actuator_state("waterServo", False)
 
+        result = "dispensed" if reached_normal else "timed_out"
         if not reached_normal:
             print(f"Water dispense timed out after {timeout_seconds}s without reaching 'normal' - check float sensor/servo")
 
-        log_water(triggered_by) 
+        log_water(triggered_by)
 
         try:
             db.reference("/notifications").push({
                 "type": "waterDispensed",
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+            db.reference("/sensor_data").update({
+                "last_water_action": {
+                    "result": result,
+                    "triggered_by": triggered_by,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
             })
         except Exception as e:
             print(f"Firebase write failed after dispense (water already dispensed OK): {e}")
@@ -952,17 +990,16 @@ def check_alerts(feed_weight, water_level, temperature, humidity, thresholds, ne
     feed_low_threshold = thresholds.get("feedLow", 20)  # percent
 
     # -------------------------
-    # Feed Level — feed_weight is a real per-second reading, so this
-    # debounces directly against load-cell noise.
+    # Feed Level — feed_weight is a real per-second reading. This branch
+    # only ever SETS feed_low_active True (with the existing debounce).
+    # Clearing ("Feed Restocked") is handled ONLY in dispense_feed(),
+    # right after a real dispense settles — never from this background
+    # loop — so raw load-cell noise (a chicken standing on/near the plate)
+    # can never flap the restocked notification on its own.
     # -------------------------
     if feed_weight is not None:
         feed_percent = (feed_weight / get_feed_capacity()) * 100
-        feed_hysteresis = getattr(config, "FEED_HYSTERESIS_PERCENT", 5)
 
-        # Feed became LOW — requires feed_confirm consecutive low readings
-        # before firing, so a single noisy dip (or a chicken briefly
-        # standing on the load cell) can't trigger a false alert. Once
-        # active, dropping further (18%, 10%, etc.) does NOT fire again.
         if feed_percent < feed_low_threshold:
             feed_clear_pending = 0
             if not feed_low_active:
@@ -982,22 +1019,9 @@ def check_alerts(feed_weight, water_level, temperature, humidity, thresholds, ne
                     )
                     update_feed_alert_state(True)
                     print(f"Low Feed: {feed_weight:.0f} g ({feed_percent:.0f}%)")
-
-        # Feed restored — must climb feed_hysteresis% above the threshold
-        # AND hold it for feed_confirm consecutive readings to clear, not
-        # just barely tick over it for one instant.
         else:
             feed_low_pending = 0
-            if feed_low_active and feed_percent >= (feed_low_threshold + feed_hysteresis):
-                feed_clear_pending += 1
-                if feed_clear_pending >= feed_confirm:
-                    feed_low_active = False
-                    feed_clear_pending = 0
-                    log_alert("Feed Restocked", f"{feed_weight:.0f} g available ({feed_percent:.0f}%)")
-                    update_feed_alert_state(False)
-                    print(f"Feed Restocked: {feed_weight:.0f} g ({feed_percent:.0f}%)")
-            else:
-                feed_clear_pending = 0
+            # NOTE: no clearing here anymore — see dispense_feed().
 
     # -------------------------
     # Water Level
