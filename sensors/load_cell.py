@@ -6,6 +6,8 @@ import argparse
 from hx711 import HX711
 import config
 import statistics
+import threading
+_hx_lock = threading.Lock()
 
 _hx = None
 
@@ -32,11 +34,11 @@ def read_raw(samples=10):
     global _hx
     if _hx is None:
         setup_hx711()
-
-    result = _hx.get_raw_data_mean(readings=samples)
+    with _hx_lock:   # the dispenser thread and main loop must never read the HX711 simultaneously
+        result = _hx.get_raw_data_mean(readings=samples)
     if result is False:
         return None
-
+    
     return result
 
 

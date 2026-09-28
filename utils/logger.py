@@ -5,18 +5,18 @@ _last_log = {}
 
 # Prevent duplicate logs within 5 minutes
 DUPLICATE_INTERVAL = 300
-
+NO_DEDUPE_TYPES = {"feeding", "water"}
 
 def _write(log_type, title, message):
     now = time.time()
-
+    
     key = f"{log_type}:{title}:{message}"
 
-    if key in _last_log:
-        if now - _last_log[key] < DUPLICATE_INTERVAL:
+    if log_type not in NO_DEDUPE_TYPES:
+        last = _last_log.get(key)
+        if last is not None and now - last < DUPLICATE_INTERVAL:
             return
-
-    _last_log[key] = now
+        _last_log[key] = now
 
     entry = {
         "type": log_type,
@@ -25,7 +25,7 @@ def _write(log_type, title, message):
         "timestamp": int(now * 1000),
         "is_read": False,
     }
-
+    
     write_log(entry)
 
 
@@ -33,16 +33,14 @@ def log_system(message):
     _write("info", "System", message)
 
 
-def log_feed(amount, triggered_by, percent=None):
+def log_feed(amount, triggered_by, percent=None, note=None):
     if percent is None:
         message = f"{amount} g ({triggered_by})"
     else:
         message = f"{amount} g ({percent}%) ({triggered_by})"
-    _write(
-        "feeding",
-        "Feed Dispensed",
-        message,
-    )
+    if note:
+        message += f" - {note}"
+    _write("feeding", "Feed Dispensed", message)
 
 
 def log_water(triggered_by):

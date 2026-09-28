@@ -8,7 +8,7 @@ import RPi.GPIO as GPIO
 from firebase_service import (
     init_firebase, push_sensor_data, get_thresholds,
     get_schedules, update_actuator_state, write_log, send_alert_push,
-    update_feed_alert_state
+    update_feed_alert_state, is_online, safe_update, push_notification,
 )
 from sensors.dht22 import read_dht22
 from sensors.load_cell import setup_hx711, read_grams, update_stable_grams, reset_stable_grams
@@ -23,6 +23,19 @@ from actuators.servo_control import (
 )
 from utils.logger import log_actuator, log_feed, log_water, log_alert, log_system
 import config
+
+import os
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def save_json_atomic(path, data):
+    # write to a temp file first, so a power cut can't leave a half-written cache
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
 import firebase_admin
 from firebase_admin import db
 
@@ -45,10 +58,10 @@ last_feeding_progress = {
 latest_feed_weight = None
 latest_water_level = None
 
-SCHEDULE_CACHE_FILE = "schedule_cache.json"
-THRESHOLD_CACHE_FILE = "threshold_cache.json"
-ALERT_STATE_FILE = "alert_state_cache.json"
-DISPENSE_RATE_CACHE_FILE = "dispense_rate_cache.json"
+SCHEDULE_CACHE_FILE = os.path.join(BASE_DIR, "schedule_cache.json")
+THRESHOLD_CACHE_FILE = os.path.join(BASE_DIR, "threshold_cache.json")
+ALERT_STATE_FILE = os.path.join(BASE_DIR, "alert_state_cache.json")
+DISPENSE_RATE_CACHE_FILE = os.path.join(BASE_DIR, "dispense_rate_cache.json")
 
 THRESHOLD_REFRESH_INTERVAL = 30  
 threshold_refresh_loops = THRESHOLD_REFRESH_INTERVAL // config.FAST_READ_INTERVAL
@@ -65,6 +78,7 @@ last_checked_minute = None
 # Alert active flags
 feed_low_active = False
 water_low_active = False     
+water_low_since = None
 temp_high_active = False
 temp_low_active = False
 hum_high_active = False
@@ -90,6 +104,8 @@ def get_feed_capacity():
 
 #  Threshold Logic 
 def get_active_thresholds():
+    if not is_online() and cached_thresholds:
+        return cached_thresholds
     # Try Firebase (live, most up-to-date)
     try:
         thresholds = get_thresholds()
@@ -97,10 +113,8 @@ def get_active_thresholds():
             # Normalize feedLow / feedlow key mismatch from the app -
             if "feedlow" in thresholds:
                 thresholds["feedLow"] = thresholds["feedlow"]
-
             try:
-                with open(THRESHOLD_CACHE_FILE, "w") as f:
-                    json.dump(thresholds, f)
+                save_json_atomic(THRESHOLD_CACHE_FILE, thresholds)
             except Exception as e:
                 print(f"Threshold cache write failed: {e}")
             return thresholds
@@ -289,39 +303,68 @@ def _read_settled_grams(capacity, samples_sets=3, delay=0.15):
         return None
     return round(statistics.median(readings), 1)
 
-
-def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None):
-    global is_dispensing_feed, last_feeding_progress
+# Feed Dispensing 
+def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None,
+                  add_mode=False, configured_percent=None):
+    """add_mode=True: target_grams = grams to ADD (manual/LCD).
+       add_mode=False: target_grams = absolute plate target (schedules).
+       configured_percent: the % the user set, this is what gets logged."""
+    global is_dispensing_feed, last_feeding_progress, latest_feed_weight
+    global feed_low_active, feed_clear_pending
     if is_dispensing_feed:
         return
 
-    capacity = get_feed_capacity()
-    current_weight = latest_feed_weight if latest_feed_weight is not None else read_grams(capacity=capacity)
-    start_weight = current_weight if current_weight is not None else 0
-
-    # target_grams is always the ABSOLUTE amount that should be on the plate
-    # when dispensing finishes — independent of what's already there.
-    target_grams = min(target_grams, capacity)
-    
-    if start_weight >= target_grams:
-        print(f"Plate already at {start_weight}g (capacity {capacity}g) - skipping, no dispense needed")
-        return
-
-    amount_requested = target_grams - start_weight
-
-    min_rate = getattr(config, "DISPENSE_MIN_RATE_GPS", 0.3)
-    avg_rate_for_buffer = max(min_rate, _load_avg_dispense_rate())
-    settle_seconds = getattr(config, "DISPENSE_SETTLE_SECONDS", 0.6)  # time feed keeps falling after close, in seconds — measure this once by eye
-    dynamic_buffer = max(config.DISPENSE_OVERSHOOT_BUFFER_GRAMS, avg_rate_for_buffer * settle_seconds)
-    stop_early_at = target_grams - dynamic_buffer
-
     is_dispensing_feed = True
-    dispense_start = time.time()
+    update_actuator_state("feedServo", True)
     try:
-        print(f"Dispensing feed: {start_weight}g -> target {target_grams}g (adding {amount_requested}g, closing early at {stop_early_at}g)")
-        update_actuator_state("feedServo", True)
+        capacity = get_feed_capacity()
+        # Measure with a ceiling far above hopper capacity so the FULL configured
+        # amount can be weighed even when the plate isn't empty.
+        read_cap = getattr(config, "LOAD_CELL_MAX_GRAMS", 5000)
 
-        timeout = time.time() + config.FEED_DISPENSE_TIMEOUT_SECONDS
+        start_weight = _read_settled_grams(read_cap, samples_sets=2)
+        if start_weight is None:
+            start_weight = latest_feed_weight if latest_feed_weight is not None else 0
+        latest_feed_weight = start_weight
+
+        if add_mode:
+            add_grams = target_grams
+            target_grams = start_weight + add_grams
+            if configured_percent is None:
+                configured_percent = (add_grams / capacity) * 100 if capacity else 0
+
+        requested_target = target_grams
+        target_grams = min(target_grams, capacity)     # never overfill the plate
+        capped = target_grams < requested_target
+        if capped:
+            print(f"Plate can only take {target_grams - start_weight:.0f}g more "
+                  f"(capacity {capacity}g) - adding less than requested")
+
+        if configured_percent is None:
+            configured_percent = (target_grams / capacity) * 100 if capacity else 0
+        configured_percent = round(configured_percent)
+
+        if start_weight >= target_grams:
+            print(f"Plate already at {start_weight}g - skipping")
+            log_system(f"Feed skipped: plate already full ({start_weight:.0f} g of {capacity:.0f} g)")
+            return
+
+        amount_requested = target_grams - start_weight
+
+        min_rate = getattr(config, "DISPENSE_MIN_RATE_GPS", 0.3)
+        settle_seconds = getattr(config, "DISPENSE_SETTLE_SECONDS", 0.6)
+        settle_wait = max(config.SERVO_CLOSE_LATENCY_SECONDS, settle_seconds)
+        min_pulse = getattr(config, "DISPENSE_MIN_PULSE_SECONDS", 0.08)
+        tolerance = config.DISPENSE_OVERSHOOT_BUFFER_GRAMS
+        stop_early_at = target_grams - tolerance
+
+        avg_rate = max(min_rate, _load_avg_dispense_rate())
+        est_seconds = amount_requested / avg_rate
+        timeout = time.time() + max(config.FEED_DISPENSE_TIMEOUT_SECONDS, est_seconds * 3 + 15)
+
+        print(f"Dispensing feed: {start_weight}g -> {target_grams}g "
+              f"(+{amount_requested:.1f}g, configured {configured_percent}%)")
+
         current_weight = start_weight
         measured_rate = None
         total_open_seconds = 0.0
@@ -329,141 +372,119 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None):
         # ---------- Bulk phase ----------
         bulk_fraction = getattr(config, "DISPENSE_BULK_FRACTION", 0.2)
         bulk_max_seconds = getattr(config, "DISPENSE_BULK_MAX_SECONDS", 5)
-
-        avg_rate = max(min_rate, _load_avg_dispense_rate())
-        bulk_grams_target = amount_requested * bulk_fraction
-        bulk_seconds = min(bulk_max_seconds, bulk_grams_target / avg_rate)
+        bulk_seconds = min(bulk_max_seconds, (amount_requested * bulk_fraction) / avg_rate)
 
         if bulk_seconds > 0.1:
-            print(f"  Bulk phase: opening {bulk_seconds:.2f}s (~{bulk_grams_target:.0f}g @ {avg_rate:.1f}g/s est.)")
-            bulk_pulse_start = time.time()
+            t0 = time.time()
             open_feed()
             time.sleep(bulk_seconds)
             close_feed()
-            actual_bulk_time = time.time() - bulk_pulse_start
-            total_open_seconds += actual_bulk_time
-            time.sleep(config.SERVO_CLOSE_LATENCY_SECONDS)
+            actual = time.time() - t0
+            total_open_seconds += actual
+            time.sleep(settle_wait)
 
-            settled = _read_settled_grams(capacity)
+            settled = _read_settled_grams(read_cap)
             if settled is not None:
                 current_weight = settled
-                bulk_dispensed = max(0.0, current_weight - start_weight)
-                if actual_bulk_time > 0 and bulk_dispensed > 0:
-                    measured_rate = bulk_dispensed / actual_bulk_time
-                print(f"  Bulk result: +{bulk_dispensed:.1f}g in {actual_bulk_time:.2f}s"
-                      + (f" (~{measured_rate:.1f}g/s)" if measured_rate else " (rate unclear, keeping estimate)"))
+                latest_feed_weight = current_weight
+                got = max(0.0, current_weight - start_weight)
+                if actual > 0 and got > 0:
+                    measured_rate = got / actual
+                print(f"  Bulk: +{got:.1f}g in {actual:.2f}s")
 
-        # ---------- Adaptive fine-tune phase ----------
-        # Small self-correcting pulses to land on the exact gram target,
-        # seeded with the rate just measured from the bulk phase (a real,
-        # multi-second measurement) instead of a noisy 0.08s guess.
         if measured_rate is None:
             measured_rate = avg_rate
 
+        # ---------- Fine-tune phase ----------
         while time.time() < timeout and current_weight < stop_early_at:
             remaining = stop_early_at - current_weight
-
-            if remaining <= 3:
-                correction = 0.3   # final fine-tuning pulses: tiny bites
-            elif remaining <= 10:
-                correction = 0.5
-            else:
-                # Higher than the old 0.08 default: measured_rate now comes
-                # from a multi-second bulk measurement, not a 0.08s probe,
-                # so it's trustworthy enough to take bigger corrective bites.
-                correction = 0.4
-
-            pulse_seconds = min(1.0, max(0.03, (remaining / measured_rate) * correction))
+            correction = 0.3 if remaining <= 3 else (0.5 if remaining <= 10 else 0.4)
+            pulse_seconds = min(1.0, max(min_pulse, (remaining / measured_rate) * correction))
 
             before = current_weight
-            pulse_start = time.time()
-
+            t0 = time.time()
             open_feed()
             time.sleep(pulse_seconds)
             close_feed()
+            actual = time.time() - t0
+            total_open_seconds += actual
+            time.sleep(settle_wait)   # let falling feed land BEFORE measuring
 
-            actual_pulse_time = time.time() - pulse_start
-            total_open_seconds += actual_pulse_time
-            time.sleep(config.SERVO_CLOSE_LATENCY_SECONDS)  # let settling/momentum finish before measuring
+            reading = read_grams(samples=8, trust_reading=True, capacity=read_cap)
+            current_weight = reading if reading is not None else before
+            latest_feed_weight = current_weight
 
-            current_weight = read_grams(samples=8, trust_reading=True, capacity=capacity)
-            if current_weight is None:
-                current_weight = before
+            gained = current_weight - before
+            if actual > 0 and gained > 0:
+                measured_rate = gained / actual
+            print(f"  Pulse {pulse_seconds:.2f}s -> +{gained:.1f}g, plate {current_weight}g")
 
-            dispensed_this_pulse = current_weight - before
-            if actual_pulse_time > 0 and dispensed_this_pulse > 0:
-                # Update the measured rate every pulse, so it keeps adapting
-                # as the hopper empties or feed settles differently.
-                measured_rate = dispensed_this_pulse / actual_pulse_time
+        if time.time() >= timeout and current_weight < stop_early_at:
+            print("Feed fail-safe: target not reached before timeout. Check hopper, servo, load cell.")
 
-            print(f"  Pulse {pulse_seconds:.2f}s -> +{dispensed_this_pulse:.1f}g, plate now {current_weight}g "
-                  f"(rate ~{measured_rate:.1f}g/s)")
-
-            if current_weight >= stop_early_at:
-                break
-
-        update_actuator_state("feedServo", False)
-        reached_target = current_weight >= stop_early_at
-        if not reached_target and time.time() >= timeout:
-            print(f"Feed fail-safe: {target_grams}g not reached after {config.FEED_DISPENSE_TIMEOUT_SECONDS}s. Check hopper, servo and load cell.")
-
-        final_weight = _read_settled_grams(capacity)
+        # ---------- Final settled reading ----------
+        time.sleep(settle_wait)
+        final_weight = _read_settled_grams(read_cap)
         if final_weight is None:
             final_weight = current_weight
         reset_stable_grams(final_weight)
+        latest_feed_weight = final_weight
 
         dispensed = max(0.0, round(final_weight - start_weight, 1))
+        accuracy_percent = round((dispensed / amount_requested) * 100) if amount_requested else 0
 
-        # Learn from the whole dispense (bulk + fine-tune combined) so the
-        # bulk-phase estimate keeps improving over successive feedings.
         if total_open_seconds > 0 and dispensed > 0:
             _save_avg_dispense_rate(dispensed / total_open_seconds)
 
-        feeding_percent = round(min(100, (dispensed / amount_requested) * 100))
-        log_feed(dispensed, triggered_by, percent=feeding_percent)
+        log_feed(dispensed, triggered_by, percent=configured_percent,
+                 note="plate full" if capped else None)
 
         last_feeding_progress = {
-            "percent": feeding_percent,
+            "percent": configured_percent,
+            "accuracy_percent": accuracy_percent,
             "grams": dispensed,
             "target_grams": amount_requested,
             "triggered_by": triggered_by,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
 
-        # ---------- Feed Restocked (only checked right here, after a real
-        # dispense settles) ----------
-        # check_alerts() only ever SETS feed_low_active True now; clearing
-        # happens only here, against a clean settled post-dispense reading,
-        # so background load-cell noise can never flap the "restocked"
-        # notification on its own.
-        global feed_low_active, feed_clear_pending
+        # Feed Restocked, using the settled post-dispense weight
         if feed_low_active:
-            capacity_for_alert = get_feed_capacity()
-            final_percent = (final_weight / capacity_for_alert) * 100 if capacity_for_alert else 0
-            feed_low_threshold = (cached_thresholds or {}).get("feedLow", config.DEFAULT_FEED_LOW)
-            feed_hysteresis = getattr(config, "FEED_HYSTERESIS_PERCENT", 5)
-            if final_percent >= (feed_low_threshold + feed_hysteresis):
+            final_percent = (final_weight / capacity) * 100 if capacity else 0
+            low_thr = (cached_thresholds or {}).get("feedLow", config.DEFAULT_FEED_LOW)
+            hyst = getattr(config, "FEED_HYSTERESIS_PERCENT", 5)
+            if final_percent >= (low_thr + hyst):
                 feed_low_active = False
                 feed_clear_pending = 0
                 log_alert("Feed Restocked", f"{final_weight:.0f} g available ({final_percent:.0f}%)")
                 update_feed_alert_state(False)
                 save_alert_state()
-                print(f"Feed Restocked: {final_weight:.0f} g ({final_percent:.0f}%)")
 
         try:
-            db.reference("/notifications").push({
+            push_notification({
                 "type": "feedDispensed",
                 "amount": dispensed,
+                "percent": configured_percent,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             })
-            db.reference('/sensor_data').update({'last_feed_time': int(time.time() * 1000)})
-            db.reference('/sensor_data').update({'feeding_progress': last_feeding_progress})
+            safe_update('/sensor_data', {
+                'last_feed_time': int(time.time() * 1000),
+                'feeding_progress': last_feeding_progress
+            })
         except Exception as e:
             print(f"Firebase write failed after dispense (feed already dispensed OK): {e}")
 
-        print(f"Feed dispensed: {dispensed}g added ({feeding_percent}% of {amount_requested}g), plate now {final_weight}g")
+        print(f"Feed dispensed: {dispensed}g ({configured_percent}% configured, "
+              f"{accuracy_percent}% of request), plate now {final_weight}g")
 
+    except Exception as e:
+        print(f"Feed dispense error: {e}")
+        try:
+            close_feed()
+        except Exception as close_err:
+            print(f"close_feed() also failed: {close_err}")
     finally:
+        update_actuator_state("feedServo", False)
         is_dispensing_feed = False
         
 #  Water Dispensing 
@@ -476,7 +497,7 @@ def dispense_water(triggered_by="schedule"):
     if current_level in ("normal", "full"):
         print(f"Water already '{current_level}' - skipping, no dispense needed")
         try:
-            db.reference("/sensor_data").update({
+            safe_update("/sensor_data", {
                 "last_water_action": {
                     "result": "skipped_already_normal",
                     "triggered_by": triggered_by,
@@ -488,9 +509,9 @@ def dispense_water(triggered_by="schedule"):
         return
 
     is_dispensing_water = True
+    update_actuator_state("waterServo", True)
     try:
         print(f"Dispensing water: current level '{current_level}'")
-        update_actuator_state("waterServo", True)
         open_water()
 
         timeout_seconds = (
@@ -517,35 +538,44 @@ def dispense_water(triggered_by="schedule"):
             time.sleep(0.3)
 
         close_water()
-        update_actuator_state("waterServo", False)
-
         result = "dispensed" if reached_normal else "timed_out"
         if not reached_normal:
             print(f"Water dispense timed out after {timeout_seconds}s without reaching 'normal' - check float sensor/servo")
 
-        log_water(triggered_by)
-
+    except Exception as e:
+        result = "error"
+        print(f"Water dispense error: {e}")
         try:
-            db.reference("/notifications").push({
-                "type": "waterDispensed",
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
-            db.reference("/sensor_data").update({
-                "last_water_action": {
-                    "result": result,
-                    "triggered_by": triggered_by,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }
-            })
-        except Exception as e:
-            print(f"Firebase write failed after dispense (water already dispensed OK): {e}")
+            close_water()   # best-effort — don't leave the valve physically open
+        except Exception as close_err:
+            print(f"close_water() also failed: {close_err}")
 
-        print("Water dispensed")
     finally:
+        update_actuator_state("waterServo", False)
         is_dispensing_water = False
+
+    log_water(triggered_by)
+
+    try:
+        push_notification({
+            "type": "waterDispensed",
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+        safe_update("/sensor_data", {
+            "last_water_action": {
+                "result": result,
+                "triggered_by": triggered_by,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        })
+    except Exception as e:
+        print(f"Firebase write failed after dispense (water already dispensed OK): {e}")
+
+    print("Water dispensed")
     
 #  Combined Sequential Dispense 
-def run_dispense_sequence(feed_grams=None, do_water=False, triggered_by="schedule", schedule_key=None):
+def run_dispense_sequence(feed_grams=None, do_water=False, triggered_by="schedule",
+                          schedule_key=None, add_mode=False, configured_percent=None):
     global is_dispensing
     if is_dispensing:
         print("Dispense already in progress, skipping.")
@@ -553,17 +583,19 @@ def run_dispense_sequence(feed_grams=None, do_water=False, triggered_by="schedul
     is_dispensing = True
     try:
         if feed_grams:
-            dispense_feed(feed_grams, triggered_by, schedule_key)   # blocks until feed finishes
+            dispense_feed(feed_grams, triggered_by, schedule_key, add_mode, configured_percent)
             if do_water:
                 print(f"Feed done - waiting {config.DISPENSE_STAGE_INTERVAL_SECONDS}s before water...")
                 time.sleep(config.DISPENSE_STAGE_INTERVAL_SECONDS)
         if do_water:
-            dispense_water(triggered_by)              # only starts after feed (+ pause) is done
+            dispense_water(triggered_by)
     finally:
         is_dispensing = False
 
 #  Schedule Fetching (offline cache) 
 def get_schedules_cached():
+    if not is_online() and cached_schedules is not None:
+        return cached_schedules
     # Try Firebase (live, up-to-date)
     try:
         schedules = get_schedules()
@@ -586,8 +618,7 @@ def get_schedules_cached():
     # empty state instead of silently keeping the old one, or a deleted
     # schedule keeps reappearing on the LCD forever.
     try:
-        with open(SCHEDULE_CACHE_FILE, "w") as f:
-            json.dump(schedules or {}, f)
+        save_json_atomic(SCHEDULE_CACHE_FILE, schedules or {})
     except Exception as e:
         print(f"Schedule cache write failed: {e}")
 
@@ -703,7 +734,7 @@ def check_schedules_with_data(schedules):
 
             threading.Thread(
                 target=run_dispense_sequence,
-                args=(amount, True, "schedule", key)
+                args=(amount, True, "schedule", key, True, percent)
             ).start()
 
             fired_schedules_this_minute.add(key)
@@ -713,6 +744,8 @@ def check_schedules_with_data(schedules):
 
 #  Manual Dispense Listener
 def check_manual_commands():
+    if not is_online():
+        return
     ref = db.reference('/sensor_data')
     try:
         data = ref.get()
@@ -727,19 +760,23 @@ def check_manual_commands():
     water_triggered = data.get('water_dispenser') == True
 
     target = None
+    manual_percent = None
     if feed_triggered:
         try:
             manual_grams = data.get('manual_dispense_grams') or 0
-            ref.update({'feeder_active': False, 'manual_dispense_grams': 0})
-            if manual_grams <= 0:
-                print("Manual feed pressed with no grams set in the app - skipping")
-                feed_triggered = False
+            manual_percent = data.get('manual_dispense_percent')
+            ref.update({'feeder_active': False, 'manual_dispense_grams': 0,
+                        'manual_dispense_percent': 0})
+            if manual_percent and manual_percent > 0:
+                target = get_feed_capacity() * manual_percent / 100   # exact, not rounded
+                print(f"Manual feed: adding {manual_percent}% = {target:.1f}g")
+            elif manual_grams > 0:
+                manual_percent = None
+                target = manual_grams
+                print(f"Manual feed: adding {manual_grams}g")
             else:
-                current = latest_feed_weight
-                if current is None:
-                    current = read_grams(samples=3, trust_reading=True, capacity=get_feed_capacity()) or 0
-                target = current + manual_grams
-                print(f"Manual feed: current {current}g + {manual_grams}g -> target {target}g")
+                print("Manual feed pressed with no amount set - skipping")
+                feed_triggered = False
         except Exception as e:
             print(f"Manual feed trigger error: {e}")
             feed_triggered = False
@@ -754,7 +791,7 @@ def check_manual_commands():
     if feed_triggered or water_triggered:
         threading.Thread(
             target=run_dispense_sequence,
-            args=(target, water_triggered, 'manual')
+            args=(target, water_triggered, 'manual', None, True, manual_percent)
         ).start()
 
 #  LCD Command Listener (local file, works fully offline)
@@ -787,18 +824,15 @@ def check_lcd_commands():
     if feed_requested:
         manual_grams = data.get("feed_dispense", {}).get("grams") or 0
         if manual_grams > 0:
-            current = latest_feed_weight
-            if current is None:
-                current = read_grams(samples=3, trust_reading=True, capacity=get_feed_capacity()) or 0
-            target = current + manual_grams
-            print(f"LCD manual feed: current {current}g + {manual_grams}g -> target {target}g")
+            target = manual_grams   # grams to ADD; dispense_feed reads the start weight itself
+            print(f"Manual feed: adding {manual_grams}g")
         else:
             print("LCD feed pressed with no grams set - skipping")
 
     if target is not None or water_triggered:
         threading.Thread(
             target=run_dispense_sequence,
-            args=(target, water_triggered, "lcd")
+            args=(target, water_triggered, "lcd", None, True)
         ).start()
  
 #  Manual Command Watcher (Firebase-based, fast, independent of the sensor loop) 
@@ -829,7 +863,7 @@ def lcd_command_watcher():
 def load_alert_state():
     """Restore alert state from disk on startup, so a restart doesn't
     think every ongoing problem (or in-progress debounce count) is new."""
-    global feed_low_active, water_low_active
+    global feed_low_active, water_low_active, water_low_since   
     global temp_high_active, temp_low_active, hum_high_active
     global feed_low_pending, feed_clear_pending
     global temp_low_pending, temp_low_clear_pending
@@ -841,6 +875,7 @@ def load_alert_state():
             state = json.load(f)
         feed_low_active = state.get("feed_low_active", False)
         water_low_active = state.get("water_low_active", False)
+        water_low_since = state.get("water_low_since", None)
         temp_high_active = state.get("temp_high_active", False)
         temp_low_active = state.get("temp_low_active", False)
         hum_high_active = state.get("hum_high_active", False)
@@ -861,11 +896,13 @@ def load_alert_state():
 
 
 def save_alert_state():
+    global water_low_since
     """Call this after check_alerts() runs so an unexpected restart can
     restore exactly what was active (and how far a debounce had progressed)."""
     state = {
         "feed_low_active": feed_low_active,
         "water_low_active": water_low_active,
+        "water_low_since": water_low_since,
         "temp_high_active": temp_high_active,
         "temp_low_active": temp_low_active,
         "hum_high_active": hum_high_active,
@@ -884,9 +921,8 @@ def save_alert_state():
     except Exception as e:
         print(f"Alert state cache write failed: {e}")
 
-
 def check_alerts(feed_weight, water_level, temperature, humidity, thresholds, new_slow_reading=False):
-    global feed_low_active, water_low_active
+    global feed_low_active, water_low_active, water_low_since
     global temp_high_active, temp_low_active, hum_high_active
     global feed_low_pending, feed_clear_pending
     global temp_low_pending, temp_low_clear_pending
@@ -918,7 +954,7 @@ def check_alerts(feed_weight, water_level, temperature, humidity, thresholds, ne
                     temp_high_active = True
                     temp_high_pending = 0
                     log_alert("Temperature High", f"{temperature:.1f}°C (above {temp_max}°C)")
-                    db.reference("/notifications").push({
+                    push_notification({
                         "type": "highTemp",
                         "value": temperature,
                         "threshold": temp_max,
@@ -944,7 +980,7 @@ def check_alerts(feed_weight, water_level, temperature, humidity, thresholds, ne
                     temp_low_active = True
                     temp_low_pending = 0
                     log_alert("Temperature Low", f"{temperature:.1f}°C (below {temp_min}°C)")
-                    db.reference("/notifications").push({
+                    push_notification({
                         "type": "lowTemp",
                         "value": temperature,
                         "threshold": temp_min,
@@ -970,7 +1006,7 @@ def check_alerts(feed_weight, water_level, temperature, humidity, thresholds, ne
                     hum_high_active = True
                     hum_high_pending = 0
                     log_alert("Humidity High", f"{humidity:.1f}% (above {hum_max}%), exhaust fan ON")
-                    db.reference("/notifications").push({
+                    push_notification({
                         "type": "humidityHigh",
                         "value": humidity,
                         "threshold": hum_max,
@@ -1008,7 +1044,7 @@ def check_alerts(feed_weight, water_level, temperature, humidity, thresholds, ne
                     feed_low_active = True
                     feed_low_pending = 0
                     log_alert("Low Feed", f"{feed_weight:.0f} g remaining ({feed_percent:.0f}%)")
-                    db.reference("/notifications").push({
+                    push_notification({
                         "type": "lowFeed",
                         "value": feed_weight,
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1030,28 +1066,26 @@ def check_alerts(feed_weight, water_level, temperature, humidity, thresholds, ne
     # sensor is discrete/categorical rather than a noisy continuous
     # reading, so there's no threshold edge for it to flap around.
     current_low = str(water_level).lower() == "low"
+    water_low_delay = getattr(config, "WATER_LOW_ALERT_DELAY_SECONDS", 1800)
 
-
-    if current_low and not water_low_active:
-        
-        water_low_active = True
-        log_alert("Low Water", "Refill needed")
-
-        db.reference("/notifications").push({
-            "type": "lowWater",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
-        send_alert_push("Low Water Alert", "Water level is low.")
-        print("Low Water")
-
-
-    elif not current_low and water_low_active:
-
-        water_low_active = False
-
-        log_alert("Water Restored", "Water level normal")
-
-        print(" Water Restored")
+    if current_low:
+        if water_low_since is None:
+            water_low_since = time.time()   # start the clock on this low streak
+        elif not water_low_active and (time.time() - water_low_since) >= water_low_delay:
+            water_low_active = True
+            log_alert("Low Water", "Refill needed")
+            push_notification({
+                "type": "lowWater",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+            send_alert_push("Low Water Alert", "Water level is low.")
+            print("Low Water")
+    else:
+        water_low_since = None   # any normal reading resets the streak
+        if water_low_active:
+            water_low_active = False
+            log_alert("Water Restored", "Water level normal")
+            print(" Water Restored")
 
     # Persist active-flag + debounce-counter state so a restart doesn't
     # re-fire alerts that are already active, or lose in-progress debounce.
@@ -1062,15 +1096,19 @@ SHARED_STATE_FILE = "shared_state.json"
 
 def write_shared_state(temperature, humidity, feed_weight, water_level, thresholds, next_schedule=None, system_online=True):
     feed_percent = (feed_weight / get_feed_capacity() * 100) if feed_weight is not None else None
-    
+    try:
+        internet_online = bool(is_online())
+    except Exception:
+        internet_online = False
+
     state = {
         "temperature": temperature,
         "humidity": humidity,
         "feed_weight": feed_weight,
         "feed_low_active": feed_low_active,
-        "feed_percent": feed_percent,          # hopper-capacity % (low-feed alert basis, unchanged)
-        "feed_capacity_grams": get_feed_capacity(), 
-        "feeding_progress": last_feeding_progress,  # per-feeding target % (e.g. 100g = 100%)
+        "feed_percent": feed_percent,
+        "feed_capacity_grams": get_feed_capacity(),
+        "feeding_progress": last_feeding_progress,
         "water_level": water_level,
         "feed_low_threshold": thresholds.get("feedLow", 20),
         "temp_min_threshold": thresholds.get("tempMin", config.DEFAULT_TEMP_MIN),
@@ -1082,6 +1120,7 @@ def write_shared_state(temperature, humidity, feed_weight, water_level, threshol
         "heating_lamp_on": heating_lamp_on,
         "exhaust_fan_on": exhaust_fan_on,
         "system_online": system_online,
+        "internet_online": internet_online,
         "next_schedule": next_schedule,
         "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
@@ -1094,7 +1133,7 @@ def write_shared_state(temperature, humidity, feed_weight, water_level, threshol
 # Main Loop 
 def main():
     print("Initializing PoultryCare system...")
-    global cached_thresholds, cached_schedules
+    global cached_thresholds, cached_schedules, latest_feed_weight, latest_water_level
     init_firebase()
     load_alert_state()
     update_feed_alert_state(feed_low_active)
@@ -1118,16 +1157,20 @@ def main():
     # Cache the last known temp/humidity so every loop iteration still
     last_temperature = None
     last_humidity = None
+    
+    cached_thresholds = get_active_thresholds()
 
     try:
         while True:
 
             # Fast sensors: read every loop 
-            instant_grams = read_grams(capacity=get_feed_capacity())
+            if is_dispensing_feed:
+                instant_grams = latest_feed_weight   # the dispenser owns the load cell right now
+            else:
+                instant_grams = read_grams(capacity=get_feed_capacity())
             feed_weight = instant_grams
             water_level = read_water_level()
 
-            global latest_feed_weight, latest_water_level   # if not already global in this scope
             if instant_grams is not None:
                 latest_feed_weight = instant_grams
             latest_water_level = water_level
@@ -1159,7 +1202,12 @@ def main():
             push_sensor_data(
                 temperature, humidity, feed_weight or 0, water_level,
                 feed_percent=feed_percent_for_app,
-                extra_updates={"actuators/exhaustFan": exhaust_fan_on}  # only when it changed this tick
+                extra_updates={
+                    "actuators/exhaustFan": exhaust_fan_on,
+                    "actuators/heatingLamp": heating_lamp_on,
+                    "actuators/feedServo": is_dispensing_feed,
+                    "actuators/waterServo": is_dispensing_water,
+                }
             )
            
             # Only hit Firebase for thresholds/schedules every ~30s, not every loop
@@ -1181,14 +1229,15 @@ def main():
 
             # Check alerts every fast loop (debounce logic inside gates
             # temp/humidity on new_slow_reading; feed debounces every loop)
-            check_alerts(feed_weight, water_level, temperature, humidity, thresholds, new_slow_reading=new_slow_reading)
+            check_alerts(None if is_dispensing_feed else feed_weight, water_level,
+                         temperature, humidity, thresholds, new_slow_reading=new_slow_reading)
 
             # Publish the debounced flag itself, so the app and LCD show
             # the SAME "low" state as this function just computed, instead of
             # each recomputing feed_percent < threshold on their own with no
             # debounce memory.
             try:
-                db.reference('/sensor_data').update({'feed_low_active': feed_low_active})
+                safe_update('/sensor_data', {'feed_low_active': feed_low_active})
             except Exception as e:
                 print(f"Feed alert state Firebase write failed: {e}")
 
@@ -1204,11 +1253,14 @@ def main():
 
     except KeyboardInterrupt:
         print("\nShutting down PoultryCare...")
-        db.reference('/sensor_data/system_online').set(False)
         turn_off_heating_lamp()
         turn_off_exhaust_fan()
         cleanup()
         cleanup_servos()
+        try:
+            db.reference('/sensor_data/system_online').set(False)
+        except Exception as e:
+            print(f"Could not set system_online False (offline?): {e}")
         print("Shutdown complete")
 
 if __name__ == "__main__":

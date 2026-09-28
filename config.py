@@ -26,7 +26,7 @@ TARGET_WEIGHT = 200           # grams — your dispense target
 DEFAULT_MANUAL_DISPENSE_GRAMS = 200
 # Feed hopper capacity
 FEED_CAPACITY_GRAMS = 150
-MANUAL_COMMAND_POLL_INTERVAL = 0.1
+MANUAL_COMMAND_POLL_INTERVAL = 0.5
 
 SCHEDULE_FEED_GRAMS = 200          # default per-schedule dispense amount (2x/day = 200g/day)
 DISPENSE_STAGE_INTERVAL_SECONDS = 3  # pause between feed servo closing and water servo opening
@@ -34,10 +34,14 @@ DISPENSE_STAGE_INTERVAL_SECONDS = 3  # pause between feed servo closing and wate
 WATER_NORMAL_CONFIRM_READS = 3      # consecutive "normal" float reads required before closing water valve
 WATER_DISPENSE_TIMEOUT_SECONDS = 300  # safety cutoff if float sensor never reports "normal"
 WATER_DISPENSE_TIMEOUT_MANUAL_SECONDS = 300  # manual dispense safety cutoff
-WATER_EXTRA_FILL_TIME = 30 #seconds to keep the water pump running after the water level sensor reads "normal" to ensure the water is topped up
+WATER_EXTRA_FILL_TIME = 50 #seconds to keep the water pump running after the water level sensor reads "normal" to ensure the water is topped up
 WATER_HARD_CAP_SECONDS = 180  # stop and assume "normal" after this long, sensor is too slow to trust beyond it
+WATER_LOW_ALERT_DELAY_SECONDS = 1800  # 30 minutes — surface-level container dips low briefly/normally
 
 FEED_HYSTERESIS_PERCENT = 5
+FEED_ALERT_CONFIRM_READS = 10
+LOAD_CELL_MAX_GRAMS = 5000              # your 5 kg cell
+ALLOW_EXCEED_CAPACITY = True
 
 # Sensor read interval (seconds)
 FAST_READ_INTERVAL = 1    # seconds - feed weight + water level
@@ -59,7 +63,8 @@ FEED_ALERT_CONFIRM_READS = 5
 TEMP_ALERT_CONFIRM_READS = 5
 HUM_ALERT_CONFIRM_READS = 5
 
-DISPENSE_OVERSHOOT_BUFFER_GRAMS = 9  # stop this many grams early to account for feed still falling after servo closes
+DISPENSE_OVERSHOOT_BUFFER_GRAMS = 1  # stop this many grams early to account for feed still falling after servo closes
+DISPENSE_MIN_PULSE_SECONDS = 0.08
 
 # Bulk-phase feed dispensing (replaces the old fixed 0.08s probe pulse)
 DISPENSE_BULK_FRACTION = 0.2      # portion of the requested amount delivered in one continuous bulk pulse

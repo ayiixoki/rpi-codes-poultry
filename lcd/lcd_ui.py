@@ -6,10 +6,12 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))  # adjust ../ to point at the main folder
 import config
+from datetime import datetime
 
 SHARED_STATE_FILE = "shared_state.json"
 LCD_COMMANDS_FILE = "lcd_commands.json"
 POLL_MS = 50  # how often the dashboard refreshes from shared_state.json
+STALE_SECONDS = 10  # if shared_state.json is older than this, main.py is assumed down
 
 # Fallback only, used until the first shared_state.json read arrives with
 # the live feed_capacity_grams value (set by the user in the app's
@@ -82,6 +84,7 @@ class PoultryDashboard(tk.Tk):
 
         self.start_screen.tkraise()
 
+        self._tick_clock()
         self._poll_state()
 
     # -- Start / splash screen -------------------------------------------
@@ -398,6 +401,10 @@ class PoultryDashboard(tk.Tk):
         except Exception as e:
             self.status_label.config(text=f"Error sending command: {e}", fg=ACCENT_RED)
 
+    def _tick_clock(self):
+        self.time_label.config(text=datetime.now().strftime("%a %d %b  %I:%M:%S %p"))
+        self.after(1000, self._tick_clock)
+
     def _poll_state(self):
         state = self._read_shared_state()
         if state:
@@ -419,7 +426,14 @@ class PoultryDashboard(tk.Tk):
         feed = state.get("feed_weight")
         water = state.get("water_level")
         online = state.get("system_online", False)
+        internet_online = state.get("internet_online", True)
         last_updated = state.get("last_updated", "")
+        try:
+            age = (datetime.now() - datetime.strptime(last_updated, "%Y-%m-%d %H:%M:%S")).total_seconds()
+            data_stale = age > STALE_SECONDS
+        except Exception:
+            data_stale = True
+            
         is_feeding = state.get("is_dispensing_feed", False)
         is_watering = state.get("is_dispensing_water", False)
         feed_low = state.get("feed_low_threshold", 20)
@@ -482,12 +496,12 @@ class PoultryDashboard(tk.Tk):
         self._set_actuator_card(self.fan_card, self.fan_state_label, exhaust_fan_on)
         self._set_actuator_card(self.lamp_card, self.lamp_state_label, heating_lamp_on)
 
-        if online:
-            self.online_label.config(text="● System ONLINE", fg=ACCENT_GREEN)
-        else:
+        if not online or data_stale:
             self.online_label.config(text="● System OFFLINE", fg=ACCENT_RED)
-
-        self.time_label.config(text=f"Last update: {last_updated}")
+        elif internet_online:
+            self.online_label.config(text="● Online Mode", fg=ACCENT_GREEN)
+        else:
+            self.online_label.config(text="● Offline Mode", fg=ACCENT_AMBER)
 
         # A schedule is only considered valid if it actually has a time set.
         # This guards against a leftover/partial dict lingering in
