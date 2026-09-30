@@ -17,7 +17,7 @@ DEFAULT_HUM_MAX = 70
 # HX711 Calibration
 HX711_OFFSET = 53792
 HX711_SCALE = 412.65
-GRAMS_PER_SECOND = 5   # fallback dispense-rate estimate until dispense_rate_cache.json has real data
+GRAMS_PER_SECOND = 15   # fallback dispense-rate estimate until dispense_rate_cache.json has real data
 
 SERVO_CLOSE_LATENCY_SECONDS = 0.25  # placeholder — measure this for real, see below
 SERVO_CLOSE_LATENCY = 0.20   # seconds — how long servo takes to fully stop feed after command sent
@@ -25,7 +25,7 @@ TARGET_WEIGHT = 200           # grams — your dispense target
 
 DEFAULT_MANUAL_DISPENSE_GRAMS = 200
 # Feed hopper capacity
-FEED_CAPACITY_GRAMS = 150
+FEED_CAPACITY_GRAMS = 420
 MANUAL_COMMAND_POLL_INTERVAL = 0.5
 
 SCHEDULE_FEED_GRAMS = 200          # default per-schedule dispense amount (2x/day = 200g/day)
@@ -35,7 +35,7 @@ WATER_NORMAL_CONFIRM_READS = 3      # consecutive "normal" float reads required 
 WATER_DISPENSE_TIMEOUT_SECONDS = 300  # safety cutoff if float sensor never reports "normal"
 WATER_DISPENSE_TIMEOUT_MANUAL_SECONDS = 300  # manual dispense safety cutoff
 WATER_EXTRA_FILL_TIME = 50 #seconds to keep the water pump running after the water level sensor reads "normal" to ensure the water is topped up
-WATER_HARD_CAP_SECONDS = 180  # stop and assume "normal" after this long, sensor is too slow to trust beyond it
+WATER_HARD_CAP_SECONDS = 320  # stop and assume "normal" after this long, sensor is too slow to trust beyond it
 WATER_LOW_ALERT_DELAY_SECONDS = 1800  # 30 minutes — surface-level container dips low briefly/normally
 
 FEED_HYSTERESIS_PERCENT = 5
@@ -63,7 +63,8 @@ FEED_ALERT_CONFIRM_READS = 5
 TEMP_ALERT_CONFIRM_READS = 5
 HUM_ALERT_CONFIRM_READS = 5
 
-DISPENSE_OVERSHOOT_BUFFER_GRAMS = 6  # stop this many grams early to account for feed still falling after servo closes
+DISPENSE_OVERSHOOT_BUFFER_GRAMS = 1  # stop this many grams early to account for feed still falling after servo closes
+DISPENSE_BULK_MIN_AMOUNT_G = 60 
 DISPENSE_MIN_PULSE_SECONDS = 0.08
 
 # Bulk-phase feed dispensing (replaces the old fixed 0.08s probe pulse)

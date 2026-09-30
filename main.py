@@ -388,7 +388,8 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None,
         bulk_max_seconds = getattr(config, "DISPENSE_BULK_MAX_SECONDS", 5)
         bulk_seconds = min(bulk_max_seconds, (amount_requested * bulk_fraction) / avg_rate)
 
-        if bulk_seconds > 0.1:
+        bulk_min = getattr(config, "DISPENSE_BULK_MIN_AMOUNT_G", 60)
+        if amount_requested >= bulk_min and bulk_seconds > 0.1:
             t0 = time.time()
             open_feed()
             time.sleep(bulk_seconds)
@@ -410,9 +411,10 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None,
             measured_rate = avg_rate
 
         # ---------- Fine-tune phase ----------
+        min_pulse_gain = None
         while time.time() < timeout and current_weight < stop_early_at and not shutdown_event.is_set():
             remaining = stop_early_at - current_weight
-            correction = 0.15  if remaining <= 3 else (0.2 if remaining <= 10 else 0.25)
+            correction = 0.15 if remaining <= 3 else (0.2 if remaining <= 10 else 0.25)
             pulse_seconds = min(0.5, max(min_pulse, (remaining / measured_rate) * correction))
 
             before = current_weight
@@ -422,17 +424,24 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None,
             close_feed()
             actual = time.time() - t0
             total_open_seconds += actual
-            time.sleep(settle_wait)   # let falling feed land BEFORE measuring
+            time.sleep(settle_wait)
 
             reading = read_grams(samples=8, trust_reading=True, capacity=read_cap)
             current_weight = reading if reading is not None else before
             latest_feed_weight = current_weight
 
             gained = current_weight - before
-            if actual > 0 and gained > 0:
-                measured_rate = gained / actual
+            if gained > 0:
+                min_pulse_gain = gained if min_pulse_gain is None else min(min_pulse_gain, gained)
+                # only trust the rate from pulses long enough for grams ≈ rate × time
+                if actual >= 0.3:
+                    measured_rate = gained / actual
             print(f"  Pulse {pulse_seconds:.2f}s -> +{gained:.1f}g, plate {current_weight}g")
 
+            # if even the smallest pulse we've seen would overshoot, stop here
+            if min_pulse_gain is not None and (stop_early_at - current_weight) < min_pulse_gain * 0.25:
+                break
+            
         if time.time() >= timeout and current_weight < stop_early_at:
             print("Feed fail-safe: target not reached before timeout. Check hopper, servo, load cell.")
 
