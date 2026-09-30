@@ -5,3 +5,4 @@ schedule_cache.json
 threshold_cache.json
 shared_state.json
 output.log
+dispense_rate_cache.json
