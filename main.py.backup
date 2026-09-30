@@ -1213,47 +1213,15 @@ def main():
     cached_schedules = get_schedules_cached()
     threading.Thread(target=sync_worker, daemon=True).start()
 
-    def cleanup_actuators():
-        print("\nShutting down PoultryCare...")
-        shutdown_event.set()
+def cleanup_actuators():
+    # Put the code you already use to make things safe, for example:
+    # close the feed and water servos, turn OFF the heating lamp and exhaust fan,
+    # write the final shared_state.json, then GPIO cleanup
+    pass
 
-        deadline = time.time() + 5
-        while (is_dispensing_feed or is_dispensing_water) and time.time() < deadline:
-            time.sleep(0.1)
-
-        try:
-            close_feed()
-            close_water()
-        except Exception as e:
-            print(f"Could not close servos on shutdown: {e}")
-
-        try:
-            turn_off_heating_lamp()
-            turn_off_exhaust_fan()
-        except Exception as e:
-            print(f"Could not turn off relays on shutdown: {e}")
-
-        try:
-            cleanup()
-            cleanup_servos()
-        except Exception as e:
-            print(f"Could not clean up GPIO: {e}")
-
-        for name in ("feedServo", "waterServo", "heatingLamp", "exhaustFan"):
-            update_actuator_state(name, False)
-
-        try:
-            db.reference('/sensor_data/system_online').set(False)
-        except Exception as e:
-            print(f"Could not set system_online False (offline?): {e}")
-
-        print("Shutdown complete")
-
-
-    def _on_sigterm(signum, frame):
-        cleanup_actuators()
-        sys.exit(0)
-
+def _on_sigterm(signum, frame):
+    cleanup_actuators()
+    sys.exit(0)
 
     signal.signal(signal.SIGTERM, _on_sigterm)
 

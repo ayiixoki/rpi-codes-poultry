@@ -15,7 +15,7 @@ DEFAULT_HUM_MIN = 50
 DEFAULT_HUM_MAX = 70
 
 # HX711 Calibration
-HX711_OFFSET = 49245
+HX711_OFFSET = 53792
 HX711_SCALE = 412.65
 GRAMS_PER_SECOND = 5   # fallback dispense-rate estimate until dispense_rate_cache.json has real data
 
@@ -63,7 +63,7 @@ FEED_ALERT_CONFIRM_READS = 5
 TEMP_ALERT_CONFIRM_READS = 5
 HUM_ALERT_CONFIRM_READS = 5
 
-DISPENSE_OVERSHOOT_BUFFER_GRAMS = 1  # stop this many grams early to account for feed still falling after servo closes
+DISPENSE_OVERSHOOT_BUFFER_GRAMS = 6  # stop this many grams early to account for feed still falling after servo closes
 DISPENSE_MIN_PULSE_SECONDS = 0.08
 
 # Bulk-phase feed dispensing (replaces the old fixed 0.08s probe pulse)

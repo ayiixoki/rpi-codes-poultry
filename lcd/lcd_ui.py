@@ -11,7 +11,7 @@ from datetime import datetime
 SHARED_STATE_FILE = "shared_state.json"
 LCD_COMMANDS_FILE = "lcd_commands.json"
 POLL_MS = 50  # how often the dashboard refreshes from shared_state.json
-STALE_SECONDS = 10  # if shared_state.json is older than this, main.py is assumed down
+STALE_SECONDS = 15  # if shared_state.json is older than this, main.py is assumed down
 
 # Fallback only, used until the first shared_state.json read arrives with
 # the live feed_capacity_grams value (set by the user in the app's
