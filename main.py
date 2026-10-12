@@ -2,20 +2,12 @@ import signal
 import sys
 import time
 import json
+import os
 import statistics
 import threading
 from datetime import datetime, timedelta
 import RPi.GPIO as GPIO
-import json, os
-
-def atomic_write_json(path, data):
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-
+from collections import deque
 
 from firebase_service import (
     init_firebase, push_sensor_data, push_sensor_data_async, get_thresholds,
@@ -24,8 +16,9 @@ from firebase_service import (
     get_online_epoch,
 )
 from sensors.dht22 import read_dht22
-from sensors.load_cell import setup_hx711, read_grams, update_stable_grams, reset_stable_grams
-from sensors.float_sensor import setup_float_sensor, read_water_level
+from sensors.load_cell import setup_hx711, read_grams, update_stable_grams, reset_stable_grams, get_last_raw
+from sensors.ultrasonic import setup_ultrasonic, read_feed_bin_percent, get_last_distance
+from sensors.float_sensor import setup_float_sensor, read_water_level, read_container_level
 from actuators.relay_control import (
     setup_relay, turn_on_heating_lamp, turn_off_heating_lamp,
     turn_on_exhaust_fan, turn_off_exhaust_fan, cleanup
@@ -37,11 +30,11 @@ from actuators.servo_control import (
 from utils.logger import log_actuator, log_feed, log_water, log_alert, log_system
 import config
 
-import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
 def save_json_atomic(path, data):
-    # write to a temp file first, so a power cut can't leave a half-written cache
+    # write to a temp file first, so a power cut can't leave a half-written file
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f)
@@ -49,15 +42,16 @@ def save_json_atomic(path, data):
         os.fsync(f.fileno())
     os.replace(tmp, path)
 
+
 import firebase_admin
 from firebase_admin import db
 
-# Global State 
+# Global State
 is_dispensing_feed = False
 is_dispensing_water = False
 heating_lamp_on = False
 exhaust_fan_on = False
-is_dispensing = False 
+is_dispensing = False
 
 
 last_feeding_progress = {
@@ -71,12 +65,38 @@ last_feeding_progress = {
 latest_feed_weight = None
 latest_water_level = None
 
+# Component health tracking (reported to the LCD "System Check" card)
+last_dht_ok_time = None
+last_load_cell_ok_time = None
+water_refill_failed = False
+STARTUP_TIME = time.time()
+NO_READING_LIMIT = getattr(config, "SENSOR_NO_READING_SECONDS",
+                           {"dht22": 120, "load_cell": 60, "feed_bin": 120})
+STUCK_LIMIT = getattr(config, "SENSOR_STUCK_SECONDS",
+                      {"dht22": 2 * 3600, "load_cell": 600, "feed_bin": 6 * 3600})
+value_last = {}          # key -> last value seen
+value_changed_at = {}    # key -> when the value last changed
+fault_reason = {}        # key -> "no_reading" | "stuck" | None
+
+water_refill_times = deque(maxlen=20)
+
+# Component fault alerts (app notification + push), one per fault, cleared on recovery.
+# water_refill is not here: dispense_water() already sends its own "Refill Failed" alert.
+COMPONENT_NAMES = {
+    "dht22": "Temp/Humidity Sensor (DHT22)",
+    "load_cell": "Feed Scale (Load Cell)",
+    "feed_bin": "Feed Container Sensor (Ultrasonic)",
+}
+component_fault_active = {"dht22": False, "load_cell": False, "feed_bin": False}
+component_bad_since = {"dht22": None, "load_cell": None, "feed_bin": None}
+component_ok_since = {"dht22": None, "load_cell": None, "feed_bin": None}
+
 SCHEDULE_CACHE_FILE = os.path.join(BASE_DIR, "schedule_cache.json")
 THRESHOLD_CACHE_FILE = os.path.join(BASE_DIR, "threshold_cache.json")
 ALERT_STATE_FILE = os.path.join(BASE_DIR, "alert_state_cache.json")
 DISPENSE_RATE_CACHE_FILE = os.path.join(BASE_DIR, "dispense_rate_cache.json")
 
-THRESHOLD_REFRESH_INTERVAL = 10  
+THRESHOLD_REFRESH_INTERVAL = 10
 threshold_refresh_loops = THRESHOLD_REFRESH_INTERVAL // config.FAST_READ_INTERVAL
 
 SCHEDULE_REFRESH_INTERVAL = 1
@@ -90,11 +110,21 @@ last_checked_minute = None
 
 # Alert active flags
 feed_low_active = False
-water_low_active = False     
-water_low_since = None
 temp_high_active = False
 temp_low_active = False
 hum_high_active = False
+container_empty_active = False
+
+# Feed container (ultrasonic sensor on top of the container)
+feed_bin_low_active = False      # True for both "low" and "empty"
+feed_bin_state = "ok"            # "ok" | "low" | "empty"
+feed_bin_pending = 0             # consecutive readings that disagree with the current state
+latest_feed_bin_percent = None
+last_bin_ok_time = None
+
+# Automatic water refill (trough float sensor)
+water_refill_cooldown_until = 0
+water_lock = threading.Lock()
 
 # Alert debounce counters (consecutive confirming / clearing readings).
 # Feed advances every fast loop (real ~1/sec reading). Temp/humidity only
@@ -113,10 +143,112 @@ hum_high_clear_pending = 0
 exhaust_fan_last_on_time = None
 shutdown_event = threading.Event()
 
+
 def get_feed_capacity():
     return (cached_thresholds or {}).get("feedCapacityGrams") or config.FEED_CAPACITY_GRAMS
 
-#  Threshold Logic 
+
+# Sensor health (shown on the LCD "System Check" card)
+def note_reading(key, value):
+    """Call with every real reading. Remembers when the value last changed."""
+    if value_last.get(key) != value:
+        value_last[key] = value
+        value_changed_at[key] = time.time()
+
+
+def get_sensor_health():
+    """True = working. A part is faulty only if it gave NO value for too long,
+    or kept giving the exact same value for a very long time (stuck)."""
+    now = time.time()
+    in_grace = (now - STARTUP_TIME) < 60          # don't flag faults right at boot
+    last_ok = {"dht22": last_dht_ok_time,
+               "load_cell": last_load_cell_ok_time,
+               "feed_bin": last_bin_ok_time}
+    health = {}
+    for key, ok_time in last_ok.items():
+        reason = None
+        if key == "load_cell" and is_dispensing_feed:
+            ok = True                                 # the dispenser owns the scale
+        elif ok_time is None:
+            ok = in_grace
+            reason = None if ok else "no_reading"
+        elif now - ok_time > NO_READING_LIMIT[key]:
+            ok, reason = False, "no_reading"
+        else:
+            changed = value_changed_at.get(key)
+            limit = STUCK_LIMIT.get(key)
+            if limit and changed and now - changed > limit:
+                ok, reason = False, "stuck"
+            else:
+                ok = True
+        health[key] = ok
+        fault_reason[key] = reason
+    health["water_refill"] = not water_refill_failed
+    return health
+
+
+def check_component_health():
+    """Same checks the LCD "System Check" card uses. Notifies the app once when a
+    component goes bad, and once when it recovers. Returns the health dict so the
+    app can show it too."""
+    health = get_sensor_health()
+    now = time.time()
+    fault_after = getattr(config, "COMPONENT_FAULT_CONFIRM_SECONDS", 10)
+    recover_after = getattr(config, "COMPONENT_RECOVER_CONFIRM_SECONDS", 30)
+    for key, label in COMPONENT_NAMES.items():
+        raw_ok = health.get(key, True)
+        # Debounce: a fault must last `fault_after` seconds before alerting, and a
+        # recovery must last `recover_after` seconds, so a flaky sensor can't spam.
+        if raw_ok:
+            component_bad_since[key] = None
+            if component_ok_since[key] is None:
+                component_ok_since[key] = now
+        else:
+            component_ok_since[key] = None
+            if component_bad_since[key] is None:
+                component_bad_since[key] = now
+        bad_for = (now - component_bad_since[key]) if component_bad_since[key] else 0
+        ok_for = (now - component_ok_since[key]) if component_ok_since[key] else 0
+
+        if bad_for >= fault_after and not component_fault_active[key]:
+            component_fault_active[key] = True
+            stuck = fault_reason.get(key) == "stuck"
+            detail = ("The reading has not changed for a long time - it may be stuck or broken."
+                      if stuck else "No readings are coming in - check the cable/connection.")
+            log_alert(f"{label} Problem", detail)
+            try:
+                push_notification({
+                    "type": "componentFault",
+                    "component": key,
+                    "name": label,
+                    "reason": "stuck" if stuck else "no_reading",
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+                send_alert_push(f"{label} Problem", detail)
+            except Exception as e:
+                print(f"Component fault notification error: {e}")
+            print(f"Component fault: {label} ({'stuck' if stuck else 'no reading'})")
+        elif ok_for >= recover_after and component_fault_active[key]:
+            component_fault_active[key] = False
+            log_alert(f"{label} Recovered", "Readings are back to normal")
+            try:
+                push_notification({
+                    "type": "componentRecovered",
+                    "component": key,
+                    "name": label,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+            except Exception as e:
+                print(f"Component recovery notification error: {e}")
+            print(f"Component recovered: {label}")
+    # The app's alert cards use this debounced state, so they don't flicker either.
+    result = dict(health)
+    for key in COMPONENT_NAMES:
+        result[key] = not component_fault_active[key]
+    return result
+
+
+#  Threshold Logic
 def get_active_thresholds():
     if not is_online() and cached_thresholds:
         return cached_thresholds
@@ -124,7 +256,7 @@ def get_active_thresholds():
     try:
         thresholds = get_thresholds()
         if thresholds:
-            # Normalize feedLow / feedlow key mismatch from the app -
+            # Normalize feedLow / feedlow key mismatch from the app
             if "feedlow" in thresholds:
                 thresholds["feedLow"] = thresholds["feedlow"]
             try:
@@ -154,7 +286,8 @@ def get_active_thresholds():
         "feedLow": config.DEFAULT_FEED_LOW
     }
 
-#  Environmental Control 
+
+#  Environmental Control
 def control_environment(temperature, humidity, thresholds):
     global heating_lamp_on, exhaust_fan_on, exhaust_fan_last_on_time
 
@@ -173,9 +306,9 @@ def control_environment(temperature, humidity, thresholds):
     else:
         need_heat = temperature < temp_min
 
-        # -----------------------------
+    # -----------------------------
     # Exhaust Fan (with hysteresis)
-    # Fully independent of the heating lamp — humidity above
+    # Fully independent of the heating lamp - humidity above
     # hum_max always opens the fan, even while the lamp is on.
     # -----------------------------
     if exhaust_fan_on:
@@ -189,7 +322,7 @@ def control_environment(temperature, humidity, thresholds):
             or (humidity is not None and humidity > hum_max)
         )
 
-    # Don't let the fan shut off again the instant conditions dip —
+    # Don't let the fan shut off again the instant conditions dip -
     # give it a minimum run time to actually vent moisture/heat out.
     if exhaust_fan_on and not need_exhaust:
         elapsed = time.time() - (exhaust_fan_last_on_time or 0)
@@ -199,7 +332,6 @@ def control_environment(temperature, humidity, thresholds):
     # =========================================
     # Heating Lamp
     # =========================================
-
     if need_heat and not heating_lamp_on:
 
         turn_on_heating_lamp()
@@ -233,7 +365,6 @@ def control_environment(temperature, humidity, thresholds):
     # =========================================
     # Exhaust Fan
     # =========================================
-
     if need_exhaust and not exhaust_fan_on:
 
         turn_on_exhaust_fan()
@@ -271,7 +402,8 @@ def control_environment(temperature, humidity, thresholds):
         log_actuator("Exhaust Fan", "OFF", reason)
         print(f"Exhaust Fan OFF ({temperature:.1f}°C, {humidity}%)")
 
-#  Dispense rate memory (feeds the bulk phase estimate) 
+
+#  Dispense rate memory (feeds the bulk phase estimate)
 def _load_avg_dispense_rate():
     """Grams/second the feeder actually delivers, learned from past
     dispenses. Falls back to config.GRAMS_PER_SECOND until we have data."""
@@ -304,7 +436,7 @@ def _save_avg_dispense_rate(new_rate):
 
 def _read_settled_grams(capacity, samples_sets=3, delay=0.15):
     """A few spaced weight readings, median-filtered. Reduces (doesn't
-    eliminate — a bird standing there the whole time will still fool it)
+    eliminate - a bird standing there the whole time will still fool it)
     the chance a single instant reading is thrown off by a chicken on
     or near the plate."""
     readings = []
@@ -317,11 +449,12 @@ def _read_settled_grams(capacity, samples_sets=3, delay=0.15):
         return None
     return round(statistics.median(readings), 1)
 
-# Feed Dispensing 
+
+# Feed Dispensing
 def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None,
                   add_mode=False, configured_percent=None):
-    """add_mode=True: target_grams = grams to ADD (manual/LCD).
-       add_mode=False: target_grams = absolute plate target (schedules).
+    """add_mode=True: target_grams = grams to ADD (manual/LCD/schedules).
+       add_mode=False: target_grams = absolute plate target.
        configured_percent: the % the user set, this is what gets logged."""
     global is_dispensing_feed, last_feeding_progress, latest_feed_weight
     global feed_low_active, feed_clear_pending
@@ -433,7 +566,7 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None,
             gained = current_weight - before
             if gained > 0:
                 min_pulse_gain = gained if min_pulse_gain is None else min(min_pulse_gain, gained)
-                # only trust the rate from pulses long enough for grams ≈ rate × time
+                # only trust the rate from pulses long enough for grams ~ rate x time
                 if actual >= 0.3:
                     measured_rate = gained / actual
             print(f"  Pulse {pulse_seconds:.2f}s -> +{gained:.1f}g, plate {current_weight}g")
@@ -441,7 +574,7 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None,
             # if even the smallest pulse we've seen would overshoot, stop here
             if min_pulse_gain is not None and (stop_early_at - current_weight) < min_pulse_gain * 0.25:
                 break
-            
+
         if time.time() >= timeout and current_weight < stop_early_at:
             print("Feed fail-safe: target not reached before timeout. Check hopper, servo, load cell.")
 
@@ -509,91 +642,172 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None,
     finally:
         update_actuator_state("feedServo", False)
         is_dispensing_feed = False
-        
-#  Water Dispensing 
-def dispense_water(triggered_by="schedule"):
-    global is_dispensing_water
-    if is_dispensing_water:
-        return
 
-    current_level = latest_water_level if latest_water_level is not None else read_water_level()
-    if current_level in ("normal", "full"):
-        print(f"Water already '{current_level}' - skipping, no dispense needed")
-        try:
-            safe_update("/sensor_data", {
-                "last_water_action": {
-                    "result": "skipped_already_normal",
-                    "triggered_by": triggered_by,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }
-            })
-        except Exception as e:
-            print(f"Firebase write failed after water skip: {e}")
-        return
 
-    is_dispensing_water = True
-    update_actuator_state("waterServo", True)
+#  Automatic Water Refill (trough float sensor)
+def container_is_empty(confirm=3, gap=0.1):
+    """Container float must read empty 3 times in a row (~0.2 s) so sloshing
+    water can't fake it."""
+    for i in range(confirm):
+        if read_container_level() != "empty":
+            return False
+        if i < confirm - 1:
+            time.sleep(gap)
+    return True
+
+
+def dispense_water(triggered_by="auto"):
+    """Opens the water servo until the drinker float reads normal.
+    Skipped when the container is empty (nothing to dispense). The valve is
+    always closed in the finally block, and rest/pause intervals keep it safe."""
+    global is_dispensing_water, water_refill_cooldown_until, water_refill_failed
+    if not water_lock.acquire(blocking=False):
+        return                      # a refill is already running
     try:
-        print(f"Dispensing water: current level '{current_level}'")
-        open_water()
+        if read_water_level() != "low" or container_is_empty():
+            return
 
-        timeout_seconds = config.WATER_HARD_CAP_SECONDS   # 180 s
-        timeout = time.time() + timeout_seconds
-
-        reached_normal = False
-        normal_confirm_count = 0
-
-        while time.time() < timeout and not shutdown_event.is_set():
-            level = read_water_level()
-            if level == "normal":
-                normal_confirm_count += 1
-                if normal_confirm_count >= config.WATER_NORMAL_CONFIRM_READS:
-                    print("Water reached normal (confirmed). Topping up...")
-                    shutdown_event.wait(config.WATER_EXTRA_FILL_TIME)
-                    reached_normal = True
-                    break
-            else:
-                normal_confirm_count = 0
-            shutdown_event.wait(0.3)
-
-        close_water()
-        result = "dispensed" if reached_normal else "timed_out"
-        if not reached_normal:
-            print(f"Water dispense timed out after {timeout_seconds}s without reaching 'normal' - check float sensor/servo")
-
-    except Exception as e:
+        is_dispensing_water = True
+        update_actuator_state("waterServo", True)
         result = "error"
-        print(f"Water dispense error: {e}")
         try:
-            close_water()   # best-effort — don't leave the valve physically open
-        except Exception as close_err:
-            print(f"close_water() also failed: {close_err}")
+            print("Auto-refill: drinker low, opening water servo")
+            open_water()
+            timeout_seconds = config.WATER_HARD_CAP_SECONDS
+            timeout = time.time() + timeout_seconds
+            reached_normal = False
+            container_ran_out = False
+            normal_confirm_count = 0
 
-    finally:
-        update_actuator_state("waterServo", False)
-        is_dispensing_water = False
+            while time.time() < timeout and not shutdown_event.is_set():
+                if container_is_empty():
+                    container_ran_out = True
+                    break
+                if read_water_level() == "normal":
+                    normal_confirm_count += 1
+                    if normal_confirm_count >= config.WATER_NORMAL_CONFIRM_READS:
+                        print("Water reached normal (confirmed). Topping up...")
+                        shutdown_event.wait(config.WATER_EXTRA_FILL_TIME)
+                        reached_normal = True
+                        break
+                else:
+                    normal_confirm_count = 0
+                shutdown_event.wait(0.3)
 
-    log_water(triggered_by)
+            if reached_normal:
+                result = "dispensed"
+            elif container_ran_out:
+                result = "container_empty"
+            elif shutdown_event.is_set():
+                result = "interrupted"
+            else:
+                result = "timed_out"
+                print(f"Water refill timed out after {timeout_seconds}s - check float sensor/servo")
+        except Exception as e:
+            print(f"Water dispense error: {e}")
+        finally:
+            # the valve is ALWAYS closed here, no matter how we got out
+            try:
+                close_water()
+            except Exception as close_err:
+                print(f"close_water() failed: {close_err}")
+            update_actuator_state("waterServo", False)
+            is_dispensing_water = False
 
-    try:
-        push_notification({
-            "type": "waterDispensed",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
-        safe_update("/sensor_data", {
-            "last_water_action": {
+        # Track refill health for the LCD / app
+        if result == "dispensed":
+            water_refill_failed = False
+        elif result == "timed_out":
+            water_refill_failed = True
+
+        if result in ("timed_out", "error"):
+            water_refill_cooldown_until = time.time() + getattr(
+                config, "WATER_REFILL_RETRY_COOLDOWN_SECONDS", 300)
+
+        if result == "timed_out":
+            log_alert("Water Refill Failed", "Trough still low after refill - check valve/sensor")
+            try:
+                push_notification({
+                    "type": "waterRefillFailed",
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+                send_alert_push("Water Refill Failed", "Trough still low - check valve/sensor.")
+            except Exception as e:
+                print(f"Refill-failed notification error: {e}")
+
+        if result == "dispensed":
+            # short rest after every refill, and a long pause if it keeps repeating
+            now = time.time()
+            water_refill_cooldown_until = now + getattr(config, "WATER_MIN_INTERVAL_SECONDS", 20)
+            water_refill_times.append(now)
+            recent = [t for t in water_refill_times if now - t < 3600]
+            if len(recent) >= getattr(config, "WATER_MAX_REFILLS_PER_HOUR", 6):
+                water_refill_cooldown_until = now + getattr(config, "WATER_REPEAT_PAUSE_SECONDS", 1800)
+                water_refill_times.clear()
+                log_alert("Water Refill Repeating",
+                          "Drinker keeps going low - paused refilling. Check for a leak or a stuck float.")
+                try:
+                    push_notification({
+                        "type": "waterRefillFailed",
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    send_alert_push("Water Refill Paused",
+                                    "The drinker keeps going low. Check for a leak or a stuck float.")
+                except Exception as e:
+                    print(f"Refill-repeat notification error: {e}")
+
+            log_water(triggered_by)
+            try:
+                push_notification({
+                    "type": "waterDispensed",
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+            except Exception as e:
+                print(f"Firebase write failed after refill: {e}")
+            print("Water refilled")
+
+        try:
+            safe_update("/sensor_data", {"last_water_action": {
                 "result": result,
                 "triggered_by": triggered_by,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        })
-    except Exception as e:
-        print(f"Firebase write failed after dispense (water already dispensed OK): {e}")
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }})
+        except Exception as e:
+            print(f"Firebase write failed after water action: {e}")
+    finally:
+        water_lock.release()
 
-    print("Water dispensed")
-    
-#  Combined Sequential Dispense 
-def run_dispense_sequence(feed_grams=None, do_water=False, triggered_by="schedule",
+
+def water_watcher():
+    """Own thread: checks the drinker float ~5x per second, so a refill starts
+    within a second even when the main loop is busy. Skips are logged ONCE
+    with the reason, so 'why didn't it open?' is visible in the Activity Log."""
+    global water_refill_failed
+    last_skip = None
+    while not shutdown_event.is_set():
+        try:
+            if read_water_level() == "normal":
+                water_refill_failed = False
+                last_skip = None
+            else:
+                skip = None
+                if container_is_empty():
+                    skip = "water container is empty"
+                elif time.time() < water_refill_cooldown_until:
+                    skip = "waiting for the safety pause to end"
+                if skip is None:
+                    last_skip = None
+                    dispense_water("auto")          # blocks until done, this thread is its own
+                elif skip != last_skip:
+                    last_skip = skip
+                    log_system(f"Water refill skipped: {skip}")
+        except Exception as e:
+            print(f"Water watcher error: {e}")
+        shutdown_event.wait(getattr(config, "WATER_CHECK_INTERVAL", 0.2))
+
+
+#  Feed Dispense Sequence (water is automatic now, feed only)
+def run_dispense_sequence(feed_grams=None, triggered_by="schedule",
                           schedule_key=None, add_mode=False, configured_percent=None):
     global is_dispensing
     if is_dispensing:
@@ -603,15 +817,11 @@ def run_dispense_sequence(feed_grams=None, do_water=False, triggered_by="schedul
     try:
         if feed_grams:
             dispense_feed(feed_grams, triggered_by, schedule_key, add_mode, configured_percent)
-            if do_water:
-                print(f"Feed done - waiting {config.DISPENSE_STAGE_INTERVAL_SECONDS}s before water...")
-                time.sleep(config.DISPENSE_STAGE_INTERVAL_SECONDS)
-        if do_water:
-            dispense_water(triggered_by)
     finally:
         is_dispensing = False
 
-#  Schedule Fetching (offline cache) 
+
+#  Schedule Fetching (offline cache)
 def get_schedules_cached():
     if not is_online() and cached_schedules is not None:
         return cached_schedules
@@ -642,6 +852,7 @@ def get_schedules_cached():
         print(f"Schedule cache write failed: {e}")
 
     return schedules
+
 
 # Find Next Scheduled Feed (for LCD display)
 def get_next_schedule_info(schedules):
@@ -700,7 +911,8 @@ def get_next_schedule_info(schedules):
         "amount_grams": best[2]
     }
 
-#  Schedule Checker 
+
+#  Schedule Checker
 def check_schedules_with_data(schedules):
     global fired_schedules_this_minute, last_checked_minute
 
@@ -751,9 +963,10 @@ def check_schedules_with_data(schedules):
                 fired_schedules_this_minute.add(key)
                 continue
 
+            # Schedules are feed only now: water refills automatically.
             threading.Thread(
                 target=run_dispense_sequence,
-                args=(amount, True, "schedule", key, True, percent)
+                args=(amount, "schedule", key, True, percent)
             ).start()
 
             fired_schedules_this_minute.add(key)
@@ -761,7 +974,8 @@ def check_schedules_with_data(schedules):
     except Exception as e:
         print(f"Schedule check error: {e}")
 
-#  Manual Dispense Listener
+
+#  Manual Dispense Listener (app feed button)
 def check_manual_commands():
     if not is_online():
         return
@@ -775,8 +989,16 @@ def check_manual_commands():
     if not data:
         return
 
+    # An old app version may still raise the water button flag. Water is
+    # automatic now, so just clear it so it doesn't sit "pressed" forever.
+    if data.get('water_dispenser') == True:
+        try:
+            ref.update({'water_dispenser': False})
+            print("Water button ignored - water is automatic now")
+        except Exception as e:
+            print(f"Could not clear water_dispenser flag: {e}")
+
     feed_triggered = data.get('feeder_active') == True
-    water_triggered = data.get('water_dispenser') == True
 
     target = None
     manual_percent = None
@@ -800,21 +1022,16 @@ def check_manual_commands():
             print(f"Manual feed trigger error: {e}")
             feed_triggered = False
 
-    if water_triggered:
-        try:
-            ref.update({'water_dispenser': False})
-        except Exception as e:
-            print(f"Manual water trigger error: {e}")
-            water_triggered = False
-
-    if feed_triggered or water_triggered:
+    if feed_triggered:
         threading.Thread(
             target=run_dispense_sequence,
-            args=(target, water_triggered, 'manual', None, True, manual_percent)
+            args=(target, 'manual', None, True, manual_percent)
         ).start()
+
 
 #  LCD Command Listener (local file, works fully offline)
 LCD_COMMANDS_FILE = "lcd_commands.json"
+
 
 def check_lcd_commands():
     try:
@@ -824,20 +1041,22 @@ def check_lcd_commands():
         return  # file doesn't exist yet or is empty - nothing to do
 
     feed_requested = data.get("feed_dispense", {}).get("requested", False)
-    water_triggered = data.get("water_dispense", {}).get("requested", False)
+    water_requested = data.get("water_dispense", {}).get("requested", False)
 
-    if not (feed_requested or water_triggered):
+    if not (feed_requested or water_requested):
         return
 
     # Clear the command file immediately so the LCD doesn't keep trying to trigger it
     try:
-        with open(LCD_COMMANDS_FILE, "w") as f:
-            json.dump({
-                "feed_dispense": {"requested": False, "grams": 0},
-                "water_dispense": {"requested": False}
-            }, f)
+        save_json_atomic(LCD_COMMANDS_FILE, {
+            "feed_dispense": {"requested": False, "grams": 0},
+            "water_dispense": {"requested": False}
+        })
     except Exception as e:
         print(f"LCD command file reset error: {e}")
+
+    if water_requested:
+        print("Water button ignored - water is automatic now")
 
     target = None
     if feed_requested:
@@ -848,13 +1067,14 @@ def check_lcd_commands():
         else:
             print("LCD feed pressed with no grams set - skipping")
 
-    if target is not None or water_triggered:
+    if target is not None:
         threading.Thread(
             target=run_dispense_sequence,
-            args=(target, water_triggered, "lcd", None, True)
+            args=(target, "lcd", None, True)
         ).start()
- 
-#  Manual Command Watcher (Firebase-based, fast, independent of the sensor loop) 
+
+
+#  Manual Command Watcher (Firebase-based, fast, independent of the sensor loop)
 def manual_command_watcher():
     poll_interval = getattr(config, 'MANUAL_COMMAND_POLL_INTERVAL', 0.5)
     while True:
@@ -864,7 +1084,8 @@ def manual_command_watcher():
             print(f"Manual command watcher error: {e}")
         time.sleep(poll_interval)
 
-#  LCD Command Watcher (local file, independent of Firebase latency) 
+
+#  LCD Command Watcher (local file, independent of Firebase latency)
 def lcd_command_watcher():
     poll_interval = getattr(config, 'LCD_COMMAND_POLL_INTERVAL', 0.2)
     while True:
@@ -874,7 +1095,8 @@ def lcd_command_watcher():
             print(f"LCD command watcher error: {e}")
         time.sleep(poll_interval)
 
-#  Alert State Persistence 
+
+#  Alert State Persistence
 # Restores both the active-alert flags AND the in-progress debounce
 # counters, so a script restart doesn't lose partial debounce progress or
 # re-fire notifications that are already active.
@@ -882,22 +1104,31 @@ def lcd_command_watcher():
 def load_alert_state():
     """Restore alert state from disk on startup, so a restart doesn't
     think every ongoing problem (or in-progress debounce count) is new."""
-    global feed_low_active, water_low_active, water_low_since   
+    global feed_low_active
     global temp_high_active, temp_low_active, hum_high_active
+    global container_empty_active
     global feed_low_pending, feed_clear_pending
     global temp_low_pending, temp_low_clear_pending
     global temp_high_pending, temp_high_clear_pending
     global hum_high_pending, hum_high_clear_pending
+    global feed_bin_low_active, feed_bin_state
 
     try:
         with open(ALERT_STATE_FILE, "r") as f:
             state = json.load(f)
         feed_low_active = state.get("feed_low_active", False)
-        water_low_active = state.get("water_low_active", False)
-        water_low_since = state.get("water_low_since", None)
         temp_high_active = state.get("temp_high_active", False)
         temp_low_active = state.get("temp_low_active", False)
         hum_high_active = state.get("hum_high_active", False)
+        container_empty_active = state.get("container_empty_active", False)
+        feed_bin_state = state.get("feed_bin_state",
+                                   "low" if state.get("feed_bin_low_active") else "ok")
+        feed_bin_low_active = feed_bin_state != "ok"
+        # Remember component faults across restarts so a restart doesn't re-notify
+        component_fault_active.update({
+            k: bool(v) for k, v in state.get("component_fault_active", {}).items()
+            if k in component_fault_active
+        })
         feed_low_pending = state.get("feed_low_pending", 0)
         feed_clear_pending = state.get("feed_clear_pending", 0)
         temp_low_pending = state.get("temp_low_pending", 0)
@@ -915,16 +1146,17 @@ def load_alert_state():
 
 
 def save_alert_state():
-    global water_low_since
     """Call this after check_alerts() runs so an unexpected restart can
     restore exactly what was active (and how far a debounce had progressed)."""
     state = {
         "feed_low_active": feed_low_active,
-        "water_low_active": water_low_active,
-        "water_low_since": water_low_since,
         "temp_high_active": temp_high_active,
         "temp_low_active": temp_low_active,
         "hum_high_active": hum_high_active,
+        "container_empty_active": container_empty_active,
+        "feed_bin_low_active": feed_bin_low_active,
+        "feed_bin_state": feed_bin_state,
+        "component_fault_active": component_fault_active,
         "feed_low_pending": feed_low_pending,
         "feed_clear_pending": feed_clear_pending,
         "temp_low_pending": temp_low_pending,
@@ -940,9 +1172,12 @@ def save_alert_state():
     except Exception as e:
         print(f"Alert state cache write failed: {e}")
 
-def check_alerts(feed_weight, water_level, temperature, humidity, thresholds, new_slow_reading=False):
-    global feed_low_active, water_low_active, water_low_since
+
+def check_alerts(feed_weight, water_level, temperature, humidity, thresholds,
+                 new_slow_reading=False, container_level=None):
+    global feed_low_active
     global temp_high_active, temp_low_active, hum_high_active
+    global container_empty_active
     global feed_low_pending, feed_clear_pending
     global temp_low_pending, temp_low_clear_pending
     global temp_high_pending, temp_high_clear_pending
@@ -957,7 +1192,7 @@ def check_alerts(feed_weight, water_level, temperature, humidity, thresholds, ne
     feed_confirm = getattr(config, "FEED_ALERT_CONFIRM_READS", 5)
 
     # -------------------------
-    # Temperature / Humidity — counters only advance on an actual new DHT22
+    # Temperature / Humidity - counters only advance on an actual new DHT22
     # sample (it only refreshes every SLOW_READ_INTERVAL seconds), so a
     # single noisy reading can't fake 5 "consistent readings" just by being
     # re-evaluated on repeated fast-loop iterations.
@@ -1045,11 +1280,11 @@ def check_alerts(feed_weight, water_level, temperature, humidity, thresholds, ne
     feed_low_threshold = thresholds.get("feedLow", 20)  # percent
 
     # -------------------------
-    # Feed Level — feed_weight is a real per-second reading. This branch
+    # Feed Level - feed_weight is a real per-second reading. This branch
     # only ever SETS feed_low_active True (with the existing debounce).
     # Clearing ("Feed Restocked") is handled ONLY in dispense_feed(),
-    # right after a real dispense settles — never from this background
-    # loop — so raw load-cell noise (a chicken standing on/near the plate)
+    # right after a real dispense settles - never from this background
+    # loop - so raw load-cell noise (a chicken standing on/near the plate)
     # can never flap the restocked notification on its own.
     # -------------------------
     if feed_weight is not None:
@@ -1076,44 +1311,101 @@ def check_alerts(feed_weight, water_level, temperature, humidity, thresholds, ne
                     print(f"Low Feed: {feed_weight:.0f} g ({feed_percent:.0f}%)")
         else:
             feed_low_pending = 0
-            # NOTE: no clearing here anymore — see dispense_feed().
+            # NOTE: no clearing here anymore - see dispense_feed().
 
     # -------------------------
-    # Water Level
+    # Water container (second float sensor) - fires immediately, no delay.
+    # The trough itself needs no alert: it refills automatically, and a
+    # failed refill raises its own "Water Refill Failed" alert.
     # -------------------------
-    # Left as a direct low/normal check (no debounce) - the float
-    # sensor is discrete/categorical rather than a noisy continuous
-    # reading, so there's no threshold edge for it to flap around.
-    current_low = str(water_level).lower() == "low"
-    water_low_delay = getattr(config, "WATER_LOW_ALERT_DELAY_SECONDS", 1800)
-
-    if current_low:
-        if water_low_since is None:
-            water_low_since = time.time()   # start the clock on this low streak
-        elif not water_low_active and (time.time() - water_low_since) >= water_low_delay:
-            water_low_active = True
-            log_alert("Low Water", "Refill needed")
+    if container_level == "empty":
+        if not container_empty_active:
+            container_empty_active = True
+            log_alert("Water Container Empty", "Container needs refill")
             push_notification({
-                "type": "lowWater",
+                "type": "containerEmpty",
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             })
-            send_alert_push("Low Water Alert", "Water level is low.")
-            print("Low Water")
-    else:
-        water_low_since = None   # any normal reading resets the streak
-        if water_low_active:
-            water_low_active = False
-            log_alert("Water Restored", "Water level normal")
-            print(" Water Restored")
+            send_alert_push("Water Container Empty", "The water container needs refill.")
+            print("Container empty")
+    elif container_level == "ok":
+        if container_empty_active:
+            container_empty_active = False
+            log_alert("Water Container Refilled", "Container has water again")
+            push_notification({
+                "type": "containerRefilled",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+            print("Container refilled")
 
     # Persist active-flag + debounce-counter state so a restart doesn't
     # re-fire alerts that are already active, or lose in-progress debounce.
     save_alert_state()
 
-# Shared State Writer (for LCD dashboard) 
-SHARED_STATE_FILE = "shared_state.json"        
 
-def write_shared_state(temperature, humidity, feed_weight, water_level, thresholds, next_schedule=None, system_online=True):
+#  Feed Container Alert (ultrasonic sensor)
+def _bin_target(percent, current):
+    low = getattr(config, "FEED_BIN_LOW_PERCENT", 20)
+    empty = getattr(config, "FEED_BIN_EMPTY_PERCENT", 5)
+    hyst = getattr(config, "FEED_BIN_HYSTERESIS_PERCENT", 5)
+    if percent < empty:
+        return "empty"
+    if current == "empty" and percent < empty + hyst:
+        return "empty"
+    if percent < low:
+        return "low"
+    if current in ("low", "empty") and percent < low + hyst:
+        return "low"
+    return "ok"
+
+
+def check_feed_bin_alert(percent, new_reading):
+    """ok / low / empty with debounce. One notification per change of state."""
+    global feed_bin_state, feed_bin_low_active, feed_bin_pending
+    if percent is None or not new_reading:
+        return
+
+    confirm = getattr(config, "FEED_BIN_CONFIRM_READS", 3)
+    target = _bin_target(percent, feed_bin_state)
+    if target == feed_bin_state:
+        feed_bin_pending = 0
+        return
+    feed_bin_pending += 1
+    if feed_bin_pending < confirm:
+        return
+
+    previous = feed_bin_state
+    feed_bin_state = target
+    feed_bin_low_active = target != "ok"
+    feed_bin_pending = 0
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        if target == "empty":
+            log_alert("Feed Container Empty", f"{percent:.0f}% left - refill now")
+            push_notification({"type": "feedBinEmpty", "value": percent, "timestamp": stamp})
+            send_alert_push("Feed Container Empty",
+                            "The feed container is empty. Please refill it now.")
+        elif target == "low" and previous == "ok":
+            log_alert("Feed Container Low", f"{percent:.0f}% left in the container")
+            push_notification({"type": "feedBinLow", "value": percent, "timestamp": stamp})
+            send_alert_push("Feed Container Low",
+                            f"Only {percent:.0f}% feed left in the container. Please refill.")
+        elif target == "ok":
+            log_alert("Feed Container Refilled", f"{percent:.0f}% in the container")
+            push_notification({"type": "feedBinRefilled", "value": percent, "timestamp": stamp})
+    except Exception as e:
+        print(f"Feed container notification error: {e}")
+    print(f"Feed container: {previous} -> {target} ({percent:.0f}%)")
+
+
+# Shared State Writer (for LCD dashboard)
+SHARED_STATE_FILE = "shared_state.json"
+
+
+def write_shared_state(temperature, humidity, feed_weight, water_level, thresholds,
+                       next_schedule=None, system_online=True, container_level=None,
+                       sensor_health=None):
     feed_percent = (feed_weight / get_feed_capacity() * 100) if feed_weight is not None else None
     try:
         internet_online = bool(is_online())
@@ -1129,6 +1421,14 @@ def write_shared_state(temperature, humidity, feed_weight, water_level, threshol
         "feed_capacity_grams": get_feed_capacity(),
         "feeding_progress": last_feeding_progress,
         "water_level": water_level,
+        "container_level": container_level,
+        "container_empty_active": container_empty_active,
+        "water_refill_failed": water_refill_failed,
+        "sensor_health": sensor_health if sensor_health is not None else get_sensor_health(),
+        "sensor_fault_reason": dict(fault_reason),
+        "feed_bin_percent": latest_feed_bin_percent,
+        "feed_bin_low_active": feed_bin_low_active,
+        "feed_bin_state": feed_bin_state,
         "feed_low_threshold": thresholds.get("feedLow", 20),
         "temp_min_threshold": thresholds.get("tempMin", config.DEFAULT_TEMP_MIN),
         "temp_max_threshold": thresholds.get("tempMax", config.DEFAULT_TEMP_MAX),
@@ -1141,7 +1441,7 @@ def write_shared_state(temperature, humidity, feed_weight, water_level, threshol
         "system_online": system_online,
         "internet_online": internet_online,
         "next_schedule": next_schedule,
-        "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     try:
         # write to a temp file then swap it in, so the LCD (reading every
@@ -1152,6 +1452,7 @@ def write_shared_state(temperature, humidity, feed_weight, water_level, threshol
         os.replace(tmp, SHARED_STATE_FILE)
     except Exception as e:
         print(f"Shared state write failed: {e}")
+
 
 # Background Sync (thresholds + schedules, off the main loop)
 def sync_worker():
@@ -1179,16 +1480,21 @@ def sync_worker():
             print(f"Sync worker error: {e}")
         shutdown_event.wait(0.5)
 
-# Main Loop 
+
+# Main Loop
 def main():
-    print("Initializing PoultryCare system...")
     global cached_thresholds, cached_schedules, latest_feed_weight, latest_water_level
+    global last_dht_ok_time, last_load_cell_ok_time
+    global last_bin_ok_time, latest_feed_bin_percent
+
+    print("Initializing PoultryCare system...")
     init_firebase()
     load_alert_state()
     update_feed_alert_state(feed_low_active)
     setup_relay()
     setup_hx711()
     setup_float_sensor()
+    setup_ultrasonic()
     setup_servos()
 
     # Power may have been cut mid-dispense: force a known-safe state
@@ -1201,7 +1507,7 @@ def main():
         update_actuator_state(name, False)
 
     print("All systems initialized. Starting main loop...")
-    
+
     threading.Thread(target=manual_command_watcher, daemon=True).start()
     threading.Thread(target=lcd_command_watcher, daemon=True).start()
 
@@ -1214,13 +1520,15 @@ def main():
     slow_read_loops = config.SLOW_READ_INTERVAL // config.FAST_READ_INTERVAL
 
     # Cache the last known temp/humidity so every loop iteration still
+    # has a value to work with between DHT22 samples
     last_temperature = None
     last_humidity = None
-    
+
     # Load both caches once, then let the background thread keep them fresh
     cached_thresholds = get_active_thresholds()
     cached_schedules = get_schedules_cached()
     threading.Thread(target=sync_worker, daemon=True).start()
+    threading.Thread(target=water_watcher, daemon=True).start()
 
     def cleanup_actuators():
         print("\nShutting down PoultryCare...")
@@ -1258,30 +1566,35 @@ def main():
 
         print("Shutdown complete")
 
-
     def _on_sigterm(signum, frame):
         cleanup_actuators()
         sys.exit(0)
-
 
     signal.signal(signal.SIGTERM, _on_sigterm)
 
     try:
         while True:
 
-            # Fast sensors: read every loop 
+            # Fast sensors: read every loop
             if is_dispensing_feed:
                 instant_grams = latest_feed_weight   # the dispenser owns the load cell right now
             else:
                 instant_grams = read_grams(capacity=get_feed_capacity())
             feed_weight = instant_grams
             water_level = read_water_level()
+            container_level = read_container_level()
 
             if instant_grams is not None:
                 latest_feed_weight = instant_grams
+            # Health uses the REAL HX711 read (read_grams() returns the last good
+            # value when the sensor gives nothing, which would hide a dead scale)
+            raw_time, raw_value = get_last_raw()
+            if raw_time is not None:
+                last_load_cell_ok_time = raw_time
+                note_reading("load_cell", raw_value)
             latest_water_level = water_level
 
-            # Slow sensor — only True this iteration if a fresh DHT22 sample
+            # Slow sensor - only True this iteration if a fresh DHT22 sample
             # was actually taken (used to gate the temp/humidity alert debounce).
             new_slow_reading = False
             if loop_count % slow_read_loops == 0:
@@ -1290,13 +1603,25 @@ def main():
                     last_temperature = temperature
                     last_humidity = humidity
                     new_slow_reading = True
+                    last_dht_ok_time = time.time()
+                    note_reading("dht22", (temperature, humidity))
+
+            # Feed container (ultrasonic) - read on the same slow schedule as the DHT22
+            new_bin_reading = False
+            if loop_count % slow_read_loops == 0:
+                bin_pct = read_feed_bin_percent()
+                if bin_pct is not None:
+                    latest_feed_bin_percent = bin_pct
+                    last_bin_ok_time = time.time()
+                    new_bin_reading = True
+                    note_reading("feed_bin", get_last_distance())
 
             temperature = last_temperature
             humidity = last_humidity
 
             feed_display = f"{feed_weight:.1f}g" if feed_weight is not None else "N/A"
             print(f"Temp: {temperature}C | Humidity: {humidity}% | "
-                f"Feed: {feed_display} | Water: {water_level}")
+                  f"Feed: {feed_display} | Water: {water_level} | Container: {container_level}")
 
             # Calculate once here, then push in the SAME call as the rest of
             # the sensor data - one write, one round trip, instead of two.
@@ -1304,7 +1629,9 @@ def main():
                 round(min(100, (feed_weight / get_feed_capacity()) * 100), 1)
                 if feed_weight is not None else None
             )
-            
+
+            health = check_component_health()
+
             push_sensor_data_async(
                 temperature, humidity, feed_weight or 0, water_level,
                 feed_percent=feed_percent_for_app,
@@ -1314,6 +1641,14 @@ def main():
                     "actuators/feedServo": is_dispensing_feed,
                     "actuators/waterServo": is_dispensing_water,
                     "sensor_data/feed_low_active": feed_low_active,
+                    "sensor_data/container_level": container_level,
+                    "sensor_data/container_empty_active": container_empty_active,
+                    "sensor_data/water_refill_failed": water_refill_failed,
+                    "sensor_data/sensor_health": health,
+                    "sensor_data/sensor_fault_reason": dict(fault_reason),
+                    "sensor_data/feed_bin_percent": latest_feed_bin_percent,
+                    "sensor_data/feed_bin_low_active": feed_bin_low_active,
+                    "sensor_data/feed_bin_state": feed_bin_state,
                 }
             )
 
@@ -1323,7 +1658,7 @@ def main():
             schedules = cached_schedules
 
             # Environmental control runs every fast loop using the latest
-            # known reading — hysteresis timing and threshold changes
+            # known reading - hysteresis timing and threshold changes
             # apply promptly, even though the DHT22 itself only refreshes
             # on the slow interval.
             if temperature is not None:
@@ -1332,14 +1667,23 @@ def main():
             # Check alerts every fast loop (debounce logic inside gates
             # temp/humidity on new_slow_reading; feed debounces every loop)
             check_alerts(None if is_dispensing_feed else feed_weight, water_level,
-                         temperature, humidity, thresholds, new_slow_reading=new_slow_reading)
+                         temperature, humidity, thresholds,
+                         new_slow_reading=new_slow_reading, container_level=container_level)
 
-            # Check feeding schedules every fast loop 
+            # Feed container alert (ultrasonic): low / empty
+            check_feed_bin_alert(latest_feed_bin_percent, new_bin_reading)
+
+            # (Water refills run in water_watcher(), its own fast thread)
+
+            # Check feeding schedules every fast loop
             check_schedules_with_data(schedules)
 
-            # Update shared state file for the LCD dashboard
+            # Update shared state file for the LCD dashboard.
+            # sensor_health=health is the DEBOUNCED health, same as the app uses.
             next_sched = get_next_schedule_info(schedules)
-            write_shared_state(temperature, humidity, feed_weight, water_level, thresholds, next_schedule=next_sched)
+            write_shared_state(temperature, humidity, feed_weight, water_level, thresholds,
+                               next_schedule=next_sched, container_level=container_level,
+                               sensor_health=health)
 
             loop_count += 1
             time.sleep(config.FAST_READ_INTERVAL)
@@ -1366,6 +1710,7 @@ def main():
         except Exception as e:
             print(f"Could not set system_online False (offline?): {e}")
         print("Shutdown complete")
+
 
 if __name__ == "__main__":
     main()

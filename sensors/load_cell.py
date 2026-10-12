@@ -14,6 +14,14 @@ _hx = None
 CALIBRATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration.json")
 _current_offset = None
 
+last_raw_ok_time = None
+last_raw_value = None
+
+
+def get_last_raw():
+    """(time of last successful HX711 read, raw value). Used by main.py for health checks."""
+    return last_raw_ok_time, last_raw_value
+
 
 def setup_hx711(warmup_reads=5, warmup_delay=1.0):
     global _hx
@@ -31,14 +39,16 @@ def setup_hx711(warmup_reads=5, warmup_delay=1.0):
 
 
 def read_raw(samples=10):
-    global _hx
+    global _hx, last_raw_ok_time, last_raw_value
     if _hx is None:
         setup_hx711()
     with _hx_lock:   # the dispenser thread and main loop must never read the HX711 simultaneously
         result = _hx.get_raw_data_mean(readings=samples)
     if result is False:
         return None
-    
+
+    last_raw_ok_time = time.time()
+    last_raw_value = result
     return result
 
 
