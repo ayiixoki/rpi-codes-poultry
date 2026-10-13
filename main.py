@@ -18,7 +18,10 @@ from firebase_service import (
 from sensors.dht22 import read_dht22
 from sensors.load_cell import setup_hx711, read_grams, update_stable_grams, reset_stable_grams, get_last_raw
 from sensors.ultrasonic import setup_ultrasonic, read_feed_bin_percent, get_last_distance
-from sensors.float_sensor import setup_float_sensor, read_water_level, read_container_level
+from sensors.float_sensor import (
+    setup_float_sensor, read_water_level, read_container_level,
+    read_water_level_settled, read_trough_raw, TROUGH_NORMAL_STATE,
+)
 from actuators.relay_control import (
     setup_relay, turn_on_heating_lamp, turn_off_heating_lamp,
     turn_on_exhaust_fan, turn_off_exhaust_fan, cleanup
@@ -126,6 +129,16 @@ last_bin_ok_time = None
 water_refill_cooldown_until = 0
 water_lock = threading.Lock()
 
+servo_lock = threading.Lock()   # only ONE servo (feed or water) may be open at a time
+feed_pending = threading.Event()   # set while a feeding is waiting for / using the servo lock
+
+
+def _acquire_servo():
+    """Wait for the other servo to finish. Returns False only if we're shutting down."""
+    while not shutdown_event.is_set():
+        if servo_lock.acquire(timeout=1.0):
+            return True
+    return False
 # Alert debounce counters (consecutive confirming / clearing readings).
 # Feed advances every fast loop (real ~1/sec reading). Temp/humidity only
 # advance when a genuinely new DHT22 sample was taken (see new_slow_reading
@@ -461,6 +474,8 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None,
     if is_dispensing_feed:
         return
 
+    feed_pending.set()            # tells a running water refill to pause and give up the lock
+    servo_lock.acquire()
     is_dispensing_feed = True
     update_actuator_state("feedServo", True)
     try:
@@ -642,6 +657,8 @@ def dispense_feed(target_grams, triggered_by="schedule", schedule_key=None,
     finally:
         update_actuator_state("feedServo", False)
         is_dispensing_feed = False
+        servo_lock.release()
+        feed_pending.clear()      # water refill may resume now
 
 
 #  Automatic Water Refill (trough float sensor)
@@ -657,37 +674,86 @@ def container_is_empty(confirm=3, gap=0.1):
 
 
 def dispense_water(triggered_by="auto"):
-    """Opens the water servo until the drinker float reads normal.
-    Skipped when the container is empty (nothing to dispense). The valve is
-    always closed in the finally block, and rest/pause intervals keep it safe."""
+    """Opens the water servo and keeps it open until the trough float reads
+    normal (confirmed), then tops up and closes. A feeding PAUSES it: the valve
+    closes, the feed runs, then the refill reopens and continues. Only one servo
+    is ever open at a time (servo_lock)."""
     global is_dispensing_water, water_refill_cooldown_until, water_refill_failed
+    global water_fail_streak
     if not water_lock.acquire(blocking=False):
         return                      # a refill is already running
     try:
         if read_water_level() != "low" or container_is_empty():
             return
 
-        is_dispensing_water = True
-        update_actuator_state("waterServo", True)
+        # Wait for the feed servo to finish. Blocks here if a feeding is running.
+        if not _acquire_servo():
+            return
+        holding = True              # True while this thread owns servo_lock
+
         result = "error"
+        raw_start = read_trough_raw()
         try:
-            print("Auto-refill: drinker low, opening water servo")
+            # the lock may have taken a while: re-check before opening
+            if read_water_level() != "low" or container_is_empty():
+                return
+
+            print("Auto-refill: trough low for 30 min, water servo open until normal")
+            is_dispensing_water = True
+            update_actuator_state("waterServo", True)
             open_water()
-            timeout_seconds = config.WATER_HARD_CAP_SECONDS
-            timeout = time.time() + timeout_seconds
+            opened_at = time.time()
+
+            max_open = config.WATER_HARD_CAP_SECONDS   # total valve-OPEN time, across pauses
+            open_used = 0.0
             reached_normal = False
             container_ran_out = False
             normal_confirm_count = 0
 
-            while time.time() < timeout and not shutdown_event.is_set():
+            while not shutdown_event.is_set():
+                if open_used + (time.time() - opened_at) >= max_open:
+                    break                                   # timed out
+
                 if container_is_empty():
                     container_ran_out = True
                     break
+
+                # ---- a feeding wants the servo: pause the refill ----
+                if feed_pending.is_set():
+                    close_water()
+                    open_used += time.time() - opened_at
+                    is_dispensing_water = False
+                    update_actuator_state("waterServo", False)
+                    servo_lock.release()
+                    holding = False
+                    print("Water refill paused - feeding in progress")
+
+                    while feed_pending.is_set() and not shutdown_event.is_set():
+                        shutdown_event.wait(0.2)            # feeding runs now
+                    if not _acquire_servo():
+                        break                               # shutting down
+                    holding = True
+
+                    if container_is_empty():
+                        container_ran_out = True
+                        break
+                    print("Feeding done - resuming water refill")
+                    is_dispensing_water = True
+                    update_actuator_state("waterServo", True)
+                    open_water()
+                    opened_at = time.time()
+                    normal_confirm_count = 0
+                    continue
+
                 if read_water_level() == "normal":
                     normal_confirm_count += 1
                     if normal_confirm_count >= config.WATER_NORMAL_CONFIRM_READS:
                         print("Water reached normal (confirmed). Topping up...")
-                        shutdown_event.wait(config.WATER_EXTRA_FILL_TIME)
+                        # top-up ends early if a feeding is waiting
+                        topup_end = time.time() + config.WATER_EXTRA_FILL_TIME
+                        while (time.time() < topup_end and not shutdown_event.is_set()
+                               and not feed_pending.is_set()):
+                            shutdown_event.wait(0.2)
                         reached_normal = True
                         break
                 else:
@@ -702,42 +768,54 @@ def dispense_water(triggered_by="auto"):
                 result = "interrupted"
             else:
                 result = "timed_out"
-                print(f"Water refill timed out after {timeout_seconds}s - check float sensor/servo")
+                print(f"Water refill timed out after {max_open}s of valve-open time - check valve/supply")
         except Exception as e:
             print(f"Water dispense error: {e}")
         finally:
-            # the valve is ALWAYS closed here, no matter how we got out
+            # the valve is ALWAYS closed; the lock is released only if we still hold it
             try:
                 close_water()
             except Exception as close_err:
                 print(f"close_water() failed: {close_err}")
             update_actuator_state("waterServo", False)
             is_dispensing_water = False
+            if holding:
+                servo_lock.release()
 
-        # Track refill health for the LCD / app
+        now = time.time()
+
         if result == "dispensed":
             water_refill_failed = False
-        elif result == "timed_out":
+            water_fail_streak = 0
+        elif result in ("timed_out", "error"):
             water_refill_failed = True
-
-        if result in ("timed_out", "error"):
-            water_refill_cooldown_until = time.time() + getattr(
+            water_fail_streak += 1
+            water_refill_cooldown_until = now + getattr(
                 config, "WATER_REFILL_RETRY_COOLDOWN_SECONDS", 300)
 
         if result == "timed_out":
-            log_alert("Water Refill Failed", "Trough still low after refill - check valve/sensor")
-            try:
-                push_notification({
-                    "type": "waterRefillFailed",
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                })
-                send_alert_push("Water Refill Failed", "Trough still low - check valve/sensor.")
-            except Exception as e:
-                print(f"Refill-failed notification error: {e}")
+            log_system(f"Refill diag: float pin {raw_start}->{read_trough_raw()} "
+                       f"(pin value meaning 'normal' = {TROUGH_NORMAL_STATE})")
+            lockout = water_fail_streak >= getattr(config, "WATER_MAX_FAILED_TRIES", 3)
+            if lockout:
+                water_refill_cooldown_until = now + getattr(
+                    config, "WATER_FAIL_LOCKOUT_SECONDS", 1800)
+                water_fail_streak = 0
+            if lockout or water_fail_streak == 1:
+                log_alert("Water Refill Failed",
+                          "Trough still low after refill - check valve/supply"
+                          + (" (auto-refill paused 30 min)" if lockout else ""))
+                try:
+                    push_notification({
+                        "type": "waterRefillFailed",
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    send_alert_push("Water Refill Failed",
+                                    "Trough still low - check valve/supply.")
+                except Exception as e:
+                    print(f"Refill-failed notification error: {e}")
 
         if result == "dispensed":
-            # short rest after every refill, and a long pause if it keeps repeating
-            now = time.time()
             water_refill_cooldown_until = now + getattr(config, "WATER_MIN_INTERVAL_SECONDS", 20)
             water_refill_times.append(now)
             recent = [t for t in water_refill_times if now - t < 3600]
@@ -779,31 +857,54 @@ def dispense_water(triggered_by="auto"):
 
 
 def water_watcher():
-    """Own thread: checks the drinker float ~5x per second, so a refill starts
-    within a second even when the main loop is busy. Skips are logged ONCE
-    with the reason, so 'why didn't it open?' is visible in the Activity Log."""
-    global water_refill_failed
+    """Own thread. A refill happens only after the trough has read LOW
+    continuously for WATER_LOW_HOLD_SECONDS (30 min). Short dips are ignored."""
+    global water_refill_failed, water_fail_streak
+    hold = getattr(config, "WATER_LOW_HOLD_SECONDS", 1800)
+    normal_reset = getattr(config, "WATER_NORMAL_RESET_SECONDS", 10)
+    low_since = None        # when the trough first read low (None = not low)
+    normal_since = None     # when it started reading normal again
     last_skip = None
+
     while not shutdown_event.is_set():
         try:
-            if read_water_level() == "normal":
-                water_refill_failed = False
-                last_skip = None
-            else:
-                skip = None
-                if container_is_empty():
-                    skip = "water container is empty"
-                elif time.time() < water_refill_cooldown_until:
-                    skip = "waiting for the safety pause to end"
-                if skip is None:
+            now = time.time()
+            level = read_water_level_settled(samples=5, gap=0.05)
+
+            if level == "normal":
+                if normal_since is None:
+                    normal_since = now
+                # only cancel the 30 min timer if it STAYS normal for a few seconds,
+                # so a float bobbing at the edge can't reset it forever
+                if now - normal_since >= normal_reset:
+                    if low_since is not None:
+                        print("Trough back to normal - 30 min low timer cancelled")
+                    low_since = None
+                    water_refill_failed = False
+                    water_fail_streak = 0
                     last_skip = None
-                    dispense_water("auto")          # blocks until done, this thread is its own
-                elif skip != last_skip:
-                    last_skip = skip
-                    log_system(f"Water refill skipped: {skip}")
+            else:
+                normal_since = None
+                if low_since is None:
+                    low_since = now
+                    log_system(f"Drinker reads low - will refill if still low in {hold // 60} min")
+
+                low_for = now - low_since
+                if low_for >= hold:
+                    skip = None
+                    if container_is_empty():
+                        skip = "water container is empty"
+                    elif now < water_refill_cooldown_until:
+                        skip = "waiting for the safety pause to end"
+                    if skip is None:
+                        last_skip = None
+                        dispense_water("auto")      # waits for feed servo, blocks until done
+                    elif skip != last_skip:
+                        last_skip = skip
+                        log_system(f"Water refill skipped: {skip}")
         except Exception as e:
             print(f"Water watcher error: {e}")
-        shutdown_event.wait(getattr(config, "WATER_CHECK_INTERVAL", 0.2))
+        shutdown_event.wait(getattr(config, "WATER_CHECK_INTERVAL", 1.0))
 
 
 #  Feed Dispense Sequence (water is automatic now, feed only)

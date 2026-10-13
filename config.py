@@ -11,7 +11,7 @@ WATER_SERVO_PIN = 25
 ULTRASONIC_ECHO_PIN = 12
 ULTRASONIC_TRIG_PIN = 23
 ULTRASONIC_FULL_CM = 5       # sensor to feed surface when container is FULL
-ULTRASONIC_EMPTY_CM = 20     # sensor to container bottom when EMPTY
+ULTRASONIC_EMPTY_CM = 25     # sensor to container bottom when EMPTY
 FEED_BIN_LOW_PERCENT = 20
 
 # Default thresholds (fallback if Firebase unreachable)
@@ -31,7 +31,7 @@ TARGET_WEIGHT = 200           # grams — your dispense target
 
 DEFAULT_MANUAL_DISPENSE_GRAMS = 200
 # Feed hopper capacity
-FEED_CAPACITY_GRAMS = 420
+FEED_CAPACITY_GRAMS = 760
 MANUAL_COMMAND_POLL_INTERVAL = 0.5
 
 SCHEDULE_FEED_GRAMS = 200          # default per-schedule dispense amount (2x/day = 200g/day)
@@ -41,7 +41,7 @@ WATER_NORMAL_CONFIRM_READS = 2      # consecutive "normal" float reads required 
 WATER_DISPENSE_TIMEOUT_SECONDS = 300  # safety cutoff if float sensor never reports "normal"
 WATER_DISPENSE_TIMEOUT_MANUAL_SECONDS = 300  # manual dispense safety cutoff
 WATER_EXTRA_FILL_TIME = 20 #seconds to keep the water pump running after the water level sensor reads "normal" to ensure the water is topped up
-WATER_HARD_CAP_SECONDS = 270  # stop and assume "normal" after this long, sensor is too slow to trust beyond it
+WATER_HARD_CAP_SECONDS = 200  # stop and assume "normal" after this long, sensor is too slow to trust beyond it
 WATER_LOW_ALERT_DELAY_SECONDS = 1800  # 30 minutes — surface-level container dips low briefly/normally
 WATER_REFILL_RETRY_COOLDOWN_SECONDS = 300
 
@@ -96,6 +96,11 @@ WATER_CHECK_INTERVAL = 0.2               # drinker float is checked ~5x per seco
 WATER_MIN_INTERVAL_SECONDS = 20          # rest after every successful refill
 WATER_MAX_REFILLS_PER_HOUR = 6           # more than this = leak/stuck float, pause and alert
 WATER_REPEAT_PAUSE_SECONDS = 1800
+
+# ---- Water refill: only after trough stays low this long ----
+WATER_LOW_HOLD_SECONDS = 1800      # trough must read low this long before any refill
+WATER_NORMAL_RESET_SECONDS = 10    # must read normal this long to cancel the 30 min timer
+WATER_CHECK_INTERVAL = 1.0         # change the existing value (0.2) to 1.0, no need to check fast
 
 # ---- Feed container ----
 FEED_BIN_EMPTY_PERCENT = 5               # below this = EMPTY (LOW is FEED_BIN_LOW_PERCENT = 20)
