@@ -9,8 +9,8 @@ TRIG_PIN = getattr(config, "ULTRASONIC_TRIG_PIN", 23)
 ECHO_PIN = getattr(config, "ULTRASONIC_ECHO_PIN", 12)
 
 # Distance from the sensor to the feed surface:
-FULL_CM = getattr(config, "ULTRASONIC_FULL_CM", 5)      # container FULL
-EMPTY_CM = getattr(config, "ULTRASONIC_EMPTY_CM", 20)   # container EMPTY (sensor to bottom)
+FULL_CM = getattr(config, "ULTRASONIC_FULL_CM", 6.8)      # container FULL
+EMPTY_CM = getattr(config, "ULTRASONIC_EMPTY_CM", 16.8)   # container EMPTY (sensor to bottom)
 
 SPEED_OF_SOUND_CM_S = 34300
 
@@ -58,25 +58,57 @@ def read_distance_cm():
         return None
 
 
-def read_feed_bin_percent(samples=5):
-    """Feed left in the container, 0-100 %. None if the sensor gives no
-    valid readings (wiring problem / sensor damaged)."""
-    global last_distance_cm
+SAMPLES = 9
+MAX_ATTEMPTS = 3                # extra batches of pings if too few echoes came back
+MIN_VALID = 3
+SMOOTH_ALPHA = 0.3              # lower = steadier, slower to react
+SNAP_CM = 1.5                   # a jump bigger than this (feed added/removed) skips smoothing
+NO_ECHO_EMPTY_BELOW = 10        # % - only if it was ALREADY nearly empty...
+NO_ECHO_CONFIRM = 6             # ...and ~1 min of reads (6 x 10 s) all had no echo
+
+_smoothed_distance = None
+_last_percent = None
+_no_echo_count = 0
+
+
+def read_feed_bin_percent(samples=SAMPLES):
+    global last_distance_cm, _smoothed_distance, _last_percent, _no_echo_count
     if EMPTY_CM <= FULL_CM:
-        print("Ultrasonic config error: ULTRASONIC_EMPTY_CM must be bigger than ULTRASONIC_FULL_CM")
+        print("Ultrasonic config error: EMPTY_CM must be bigger than FULL_CM")
         return None
 
     readings = []
-    for _ in range(samples):
-        d = read_distance_cm()
-        if d is not None:
-            readings.append(d)
-        time.sleep(0.06)
+    for _ in range(MAX_ATTEMPTS):
+        for _ in range(samples):
+            d = read_distance_cm()
+            if d is not None:
+                readings.append(d)
+            time.sleep(0.06)
+        if len(readings) >= MIN_VALID:
+            break
 
-    if len(readings) < 3:
+    if len(readings) < MIN_VALID:
+        # No usable echo. Only call it "empty" if it was already almost empty
+        # AND this keeps happening for a while. Otherwise keep the old value.
+        _no_echo_count += 1
+        if (_last_percent is not None and _last_percent <= NO_ECHO_EMPTY_BELOW
+                and _no_echo_count >= NO_ECHO_CONFIRM):
+            _last_percent = 0.0
+            return 0.0
         return None
 
-    distance = statistics.median(readings)       # median ignores stray bad readings
+    _no_echo_count = 0
+    readings.sort()
+    trimmed = readings[1:-1] if len(readings) > 4 else readings   # drop min/max
+    distance = statistics.median(trimmed)
     last_distance_cm = round(distance, 3)
-    percent = (EMPTY_CM - distance) / (EMPTY_CM - FULL_CM) * 100
-    return round(max(0.0, min(100.0, percent)), 1)
+
+    # Smooth across calls, but react right away to a big change (feed added)
+    if _smoothed_distance is None or abs(distance - _smoothed_distance) > SNAP_CM:
+        _smoothed_distance = distance
+    else:
+        _smoothed_distance += SMOOTH_ALPHA * (distance - _smoothed_distance)
+
+    percent = (EMPTY_CM - _smoothed_distance) / (EMPTY_CM - FULL_CM) * 100
+    _last_percent = round(max(0.0, min(100.0, percent)), 1)
+    return _last_percent

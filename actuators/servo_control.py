@@ -29,15 +29,15 @@ def close_feed():
 
 def open_feed():
     print("Feed servo OPENING...")
-    set_angle(feed_pwm, 20)
+    set_angle(feed_pwm, 15)
 
 def close_water():
     print("Water servo CLOSING...")
-    set_angle(water_pwm, 10)
+    set_angle(water_pwm, 20)
     
 def open_water():
     print("Water servo OPENING...")
-    set_angle(water_pwm, 90)
+    set_angle(water_pwm, 180)
 
 def cleanup_servos():
     feed_pwm.stop()

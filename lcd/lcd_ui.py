@@ -26,6 +26,7 @@ BG_DARK = "#1e2328"
 BG_CARD = "#2a3038"
 BG_CARD_ALT = "#323a44"
 BG_ALERT = "#4a2a29"
+BG_WARN = "#3a3320"
 ACCENT_GREEN = "#4caf7d"
 ACCENT_RED = "#e5605a"
 ACCENT_BLUE = "#4a90d9"
@@ -66,13 +67,14 @@ class PoultryDashboard(tk.Tk):
         self.heartbeat_on = False
         self.last_heartbeat_write = 0
 
-        self.font_big = tkfont.Font(family="DejaVu Sans", size=30, weight="bold")
-        self.font_med = tkfont.Font(family="DejaVu Sans", size=18, weight="bold")
-        self.font_small = tkfont.Font(family="DejaVu Sans", size=13, weight="bold")
-        self.font_badge = tkfont.Font(family="DejaVu Sans", size=13, weight="bold")
-        self.font_button = tkfont.Font(family="DejaVu Sans", size=16, weight="bold")
-        self.font_tiny = tkfont.Font(family="DejaVu Sans", size=12, weight="normal")
-        self.font_title = tkfont.Font(family="DejaVu Sans", size=32, weight="bold")
+        # Smaller fonts than before so everything fits the 800x480 screen
+        self.font_big = tkfont.Font(family="DejaVu Sans", size=24, weight="bold")
+        self.font_med = tkfont.Font(family="DejaVu Sans", size=14, weight="bold")
+        self.font_small = tkfont.Font(family="DejaVu Sans", size=10, weight="bold")
+        self.font_badge = tkfont.Font(family="DejaVu Sans", size=10, weight="bold")
+        self.font_button = tkfont.Font(family="DejaVu Sans", size=13, weight="bold")
+        self.font_tiny = tkfont.Font(family="DejaVu Sans", size=9, weight="normal")
+        self.font_title = tkfont.Font(family="DejaVu Sans", size=28, weight="bold")
 
         # Container holds both screens stacked on top of each other.
         self.container = tk.Frame(self, bg=BG_DARK)
@@ -133,7 +135,7 @@ class PoultryDashboard(tk.Tk):
 
     # -- Main dashboard ----------------------------------------------------
     def _build_layout(self):
-        self.status_bar = tk.Frame(self.dashboard_screen, bg=BG_CARD, height=40)
+        self.status_bar = tk.Frame(self.dashboard_screen, bg=BG_CARD, height=36)
         self.status_bar.pack(fill="x", side="top")
         self.status_bar.pack_propagate(False)
 
@@ -163,7 +165,7 @@ class PoultryDashboard(tk.Tk):
             self.status_bar, text="● System OFFLINE", font=self.font_small,
             bg=BG_CARD, fg=ACCENT_RED
         )
-        self.online_label.pack(side="left", padx=15)
+        self.online_label.pack(side="left", padx=12)
 
         title = tk.Label(
             self.status_bar, text="PoultryCare", font=self.font_med,
@@ -172,7 +174,7 @@ class PoultryDashboard(tk.Tk):
         title.pack(side="left", padx=5)
 
         content = tk.Frame(self.dashboard_screen, bg=BG_DARK)
-        content.pack(fill="both", expand=True, padx=10, pady=3)
+        content.pack(fill="both", expand=True, padx=10, pady=4)
 
         left = tk.Frame(content, bg=BG_DARK, width=380)
         left.pack(side="left", fill="both", expand=True, padx=(0, 8))
@@ -183,8 +185,8 @@ class PoultryDashboard(tk.Tk):
         right.pack_propagate(False)
 
         # ---- Left column: sensors, actuators, next schedule ----
-        sensor_grid = tk.Frame(left, bg=BG_DARK, height=258)
-        sensor_grid.pack(fill="x", pady=(0, 3))
+        sensor_grid = tk.Frame(left, bg=BG_DARK, height=236)
+        sensor_grid.pack(fill="x", pady=(0, 4))
         sensor_grid.pack_propagate(False)
         sensor_grid.grid_columnconfigure(0, weight=1)
         sensor_grid.grid_columnconfigure(1, weight=1)
@@ -197,7 +199,7 @@ class PoultryDashboard(tk.Tk):
         self.hum_card, self.hum_value, self.hum_badge = self._make_reading_card(sensor_grid, "Humidity", "-- %")
         self.hum_card.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 3))
 
-        self.feed_card, self.feed_value, self.feed_badge = self._make_reading_card(sensor_grid, "Feed Level", "-- %")
+        self.feed_card, self.feed_value, self.feed_badge = self._make_reading_card(sensor_grid, "Feed Level (plate)", "-- %")
         self.feed_card.grid(row=1, column=0, sticky="nsew", padx=(0, 4), pady=(3, 0))
 
         # "Drinker" = the trough the chickens drink from (float sensor 1).
@@ -205,8 +207,8 @@ class PoultryDashboard(tk.Tk):
         self.water_card, self.water_value, self.water_badge = self._make_reading_card(sensor_grid, "Drinker", "--")
         self.water_card.grid(row=1, column=1, sticky="nsew", padx=(4, 0), pady=(3, 0))
 
-        actuator_section = tk.Frame(left, bg=BG_DARK, height=108)
-        actuator_section.pack(fill="x", pady=(0, 3))
+        actuator_section = tk.Frame(left, bg=BG_DARK, height=92)
+        actuator_section.pack(fill="x", pady=(0, 4))
         actuator_section.pack_propagate(False)
 
         actuator_title = tk.Label(
@@ -227,15 +229,15 @@ class PoultryDashboard(tk.Tk):
         self.lamp_card, self.lamp_state_label = self._make_actuator_card(actuator_row, "Heating Lamp")
         self.lamp_card.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
 
-        self.schedule_card = tk.Frame(left, bg=BG_CARD_ALT, height=72)
+        self.schedule_card = tk.Frame(left, bg=BG_CARD_ALT, height=62)
         self.schedule_card.pack(fill="x")
         self.schedule_card.pack_propagate(False)
 
         schedule_label = tk.Label(
             self.schedule_card, text="Next Scheduled Feed", font=self.font_small,
-            bg=BG_CARD_ALT, fg=TEXT_MAIN, anchor="w"
+            bg=BG_CARD_ALT, fg=TEXT_DIM, anchor="w"
         )
-        schedule_label.pack(fill="x", padx=12, pady=(4, 0))
+        schedule_label.pack(fill="x", padx=12, pady=(5, 0))
 
         self.schedule_value = tk.Label(
             self.schedule_card, text="No schedule set", font=self.font_med,
@@ -243,7 +245,7 @@ class PoultryDashboard(tk.Tk):
         )
         self.schedule_value.pack(fill="x", padx=12, pady=(0, 2))
 
-        # ---- Right column: manual feed, feed container, system check ----
+        # ---- Right column: manual feed, containers, system check ----
         # Status line is packed to the bottom FIRST so it can never be
         # pushed off-screen by the cards above it.
         self.status_label = tk.Label(
@@ -253,35 +255,27 @@ class PoultryDashboard(tk.Tk):
         self.status_label.pack(side="bottom", fill="x", pady=(2, 0))
 
         controls_label = tk.Label(
-            right, text="Manual Dispense", font=self.font_med,
+            right, text="Manual Feed", font=self.font_med,
             bg=BG_DARK, fg=TEXT_MAIN, anchor="w"
         )
-        controls_label.pack(fill="x", pady=(0, 4))
-
-        feed_frame = tk.Frame(right, bg=BG_DARK)
-        feed_frame.pack(fill="x", pady=(0, 6))
-
-        feed_title = tk.Label(
-            feed_frame, text="Feed", font=self.font_med, bg=BG_DARK, fg=TEXT_MAIN, anchor="w"
-        )
-        feed_title.pack(fill="x")
+        controls_label.pack(fill="x", pady=(0, 2))
 
         # Manual dispense steps in 10% increments of the LIVE hopper
         # capacity (self.feed_capacity_grams, kept in sync from shared_state.json).
         self.custom_percent = tk.IntVar(value=10)
         self.custom_percent_display = tk.StringVar(value="10 %")
 
-        custom_frame = tk.Frame(feed_frame, bg=BG_DARK)
-        custom_frame.pack(fill="x", pady=(6, 0))
+        custom_frame = tk.Frame(right, bg=BG_DARK)
+        custom_frame.pack(fill="x", pady=(0, 4))
 
         custom_title = tk.Label(
-            custom_frame, text="Feed Amount (% of hopper capacity):", font=self.font_small,
-            bg=BG_DARK, fg=TEXT_MAIN, anchor="w"
+            custom_frame, text="Amount to add (% of the feed plate size):", font=self.font_tiny,
+            bg=BG_DARK, fg=TEXT_DIM, anchor="w"
         )
         custom_title.pack(fill="x")
 
         stepper_row = tk.Frame(custom_frame, bg=BG_DARK)
-        stepper_row.pack(fill="x", pady=(4, 0))
+        stepper_row.pack(fill="x", pady=(2, 0))
 
         minus_btn = tk.Button(
             stepper_row, text="−", font=self.font_button,
@@ -306,68 +300,81 @@ class PoultryDashboard(tk.Tk):
         plus_btn.pack(side="left", fill="y", padx=(6, 0))
 
         self.custom_dispense_btn = tk.Button(
-            custom_frame, text="Dispense Feeds", font=self.font_button,
+            custom_frame, text="Dispense Feed", font=self.font_button,
             bg=ACCENT_GREEN, fg="white", activebackground="#3d8a63",
-            relief="flat", height=2,
+            relief="flat", height=1, pady=4,
             command=lambda: self._dispense_feed(self.custom_percent.get())
         )
         self.custom_dispense_btn.pack(fill="x", pady=(4, 0))
 
         manual_note = tk.Label(
-            right,
-            text="Water refills automatically. Use the button above to dispense feed manually.",
-            font=self.font_tiny, bg=BG_DARK, fg=TEXT_DIM, anchor="w",
-            justify="left", wraplength=360
+            right, text="Water refills by itself.",
+            font=self.font_tiny, bg=BG_DARK, fg=TEXT_DIM, anchor="w", justify="left"
         )
         manual_note.pack(fill="x", pady=(0, 2))
 
-        # Feed container card (ultrasonic sensor on top of the feed container)
-        self.bin_card = tk.Frame(right, bg=BG_CARD)
-        self.bin_card.pack(fill="x", pady=(4, 3))
-        self.bin_label = tk.Label(
-            self.bin_card, text="Feed Container", font=self.font_small,
-            bg=BG_CARD, fg=TEXT_DIM, anchor="w"
+        # Two container cards side by side: feed container + water container.
+        bins_title = tk.Label(
+            right, text="Containers", font=self.font_small,
+            bg=BG_DARK, fg=TEXT_DIM, anchor="w"
         )
-        self.bin_label.pack(side="left", padx=12, pady=8)
-        self.bin_value = tk.Label(
-            self.bin_card, text="--", font=self.font_med,
-            bg=BG_CARD, fg=TEXT_MAIN, anchor="e"
-        )
-        self.bin_value.pack(side="right", padx=12, pady=6)
+        bins_title.pack(fill="x")
+
+        bins_row = tk.Frame(right, bg=BG_DARK)
+        bins_row.pack(fill="x", pady=(2, 4))
+        bins_row.grid_columnconfigure(0, weight=1, uniform="bins")
+        bins_row.grid_columnconfigure(1, weight=1, uniform="bins")
+
+        self.feed_bin_card = self._make_container_card(bins_row, "Feed Container")
+        self.feed_bin_card["frame"].grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+
+        self.water_bin_card = self._make_container_card(bins_row, "Water Container")
+        self.water_bin_card["frame"].grid(row=0, column=1, sticky="nsew", padx=(4, 0))
 
         # System check card: plain-language problems for non-technical users.
         self.health_card = tk.Frame(right, bg=BG_CARD)
-        self.health_card.pack(fill="x", pady=(3, 0))
+        self.health_card.pack(fill="x", pady=(0, 0))
         self.health_title = tk.Label(
             self.health_card, text="System Check: --", font=self.font_small,
             bg=BG_CARD, fg=TEXT_DIM, anchor="w"
         )
-        self.health_title.pack(fill="x", padx=12, pady=(5, 2))
+        self.health_title.pack(fill="x", padx=10, pady=(4, 1))
 
         self.health_msg = tk.Label(
             self.health_card, text="", font=self.font_tiny, bg=BG_CARD, fg=TEXT_DIM,
             anchor="w", justify="left", wraplength=350
         )
-        self.health_msg.pack(fill="x", padx=12, pady=(0, 6))
+        self.health_msg.pack(fill="x", padx=10, pady=(0, 5))
 
     def _make_reading_card(self, parent, label_text, initial_value):
         card = tk.Frame(parent, bg=BG_CARD)
         label = tk.Label(card, text=label_text, font=self.font_small, bg=BG_CARD, fg=TEXT_DIM, anchor="w")
-        label.pack(fill="x", padx=12, pady=(4, 0))
+        label.pack(fill="x", padx=12, pady=(5, 0))
         value = tk.Label(card, text=initial_value, font=self.font_big, bg=BG_CARD, fg=TEXT_MAIN, anchor="w")
         value.pack(fill="x", padx=12, pady=(0, 2))
         badge = tk.Label(card, text="--", font=self.font_badge, bg=BADGE_NORMAL[0], fg=BADGE_NORMAL[1], anchor="w", padx=7, pady=0)
-        badge.pack(fill="none", anchor="w", padx=12, pady=(0, 4))
+        badge.pack(fill="none", anchor="w", padx=12, pady=(0, 5))
         return card, value, badge
 
     def _make_actuator_card(self, parent, label_text):
         card = tk.Frame(parent, bg=ACTUATOR_OFF_BG)
         label = tk.Label(card, text=label_text, font=self.font_small, bg=ACTUATOR_OFF_BG, fg=TEXT_DIM, anchor="w")
-        label.pack(fill="x", padx=12, pady=(5, 0))
+        label.pack(fill="x", padx=12, pady=(6, 0))
         state_label = tk.Label(card, text="OFF", font=self.font_med, bg=ACTUATOR_OFF_BG, fg=TEXT_DIM, anchor="w")
         state_label.pack(fill="x", padx=12, pady=(0, 4))
         card._name_label = label
         return card, state_label
+
+    def _make_container_card(self, parent, title_text):
+        """Small card: title, one big easy word (Full / Normal / Low / Empty) and a hint line."""
+        frame = tk.Frame(parent, bg=BG_CARD)
+        title = tk.Label(frame, text=title_text, font=self.font_small, bg=BG_CARD, fg=TEXT_DIM, anchor="w")
+        title.pack(fill="x", padx=10, pady=(5, 0))
+        value = tk.Label(frame, text="--", font=self.font_med, bg=BG_CARD, fg=TEXT_DIM, anchor="w")
+        value.pack(fill="x", padx=10)
+        hint = tk.Label(frame, text=" ", font=self.font_tiny, bg=BG_CARD, fg=TEXT_DIM, anchor="w")
+        hint.pack(fill="x", padx=10, pady=(0, 5))
+        return {"frame": frame, "title": title, "value": value, "hint": hint}
 
     def _set_badge(self, badge_label, text, level):
         colors = {
@@ -383,36 +390,61 @@ class PoultryDashboard(tk.Tk):
         card._name_label.config(bg=bg)
         state_label.config(text="ON" if is_on else "OFF", bg=bg, fg=fg)
 
-    def _set_bin(self, percent, state, sensor_ok, dim=False):
-        """Feed container card. state: ok / low / empty."""
+    # Container cards show plain words, no percentages.
+    #   Full / Normal -> green     Low -> amber (refill soon)     Empty -> red (refill now)
+    HINTS = {
+        "feed": {"Low": "Refill soon", "Empty": "Refill now"},
+        "water": {"Low": "Please refill"},
+    }
+
+    def _set_container(self, card, kind, label, sensor_ok=True, dim=False):
         if not sensor_ok:
-            bg, text, fg = BG_ALERT, "⚠ Sensor problem", ACCENT_RED
-        elif percent is None:
-            bg, text, fg = BG_CARD, "--", TEXT_DIM
-        elif state == "empty":
-            bg, text, fg = BG_ALERT, "⚠ EMPTY", ACCENT_RED
-        elif state == "low":
-            bg, text, fg = BG_ALERT, f"⚠ LOW {percent:.0f} %", ACCENT_RED
+            bg, text, fg, hint = BG_ALERT, "Sensor problem", ACCENT_RED, "Check its cable"
+        elif label in (None, "--"):
+            bg, text, fg, hint = BG_CARD, "--", TEXT_DIM, " "
+        elif label == "Empty":
+            bg, text, fg = BG_ALERT, "Empty", ACCENT_RED
+            hint = self.HINTS.get(kind, {}).get("Empty", "Refill now")
+        elif label == "Low":
+            bg, text, fg = BG_WARN, "Low", ACCENT_AMBER
+            hint = self.HINTS.get(kind, {}).get("Low", "Refill soon")
         else:
-            bg, text, fg = BG_CARD, f"Has feed {percent:.0f} %", (TEXT_DIM if dim else ACCENT_GREEN)
-        self.bin_card.config(bg=bg)
-        self.bin_label.config(bg=bg)
-        self.bin_value.config(text=text, bg=bg, fg=fg)
+            bg, text, fg, hint = BG_CARD, label, (TEXT_DIM if dim else ACCENT_GREEN), " "
+        card["frame"].config(bg=bg)
+        card["title"].config(bg=bg)
+        card["value"].config(text=text, bg=bg, fg=fg)
+        card["hint"].config(text=hint, bg=bg, fg=fg if hint.strip() else TEXT_DIM)
 
     # -- Fail-safe: component health (plain language) ---------------------
     PART_NAMES = {
-        "dht22": "Temperature & humidity sensor",
+        "dht22": "Temp & humidity sensor",
         "load_cell": "Feed scale",
         "feed_bin": "Feed container sensor",
+        "feed_servo": "Feed dispenser",
+        "water_refill": "Drinker refill",
+        "heating_lamp": "Heating lamp",
+        "exhaust_fan": "Exhaust fan",
+    }
+    SENSOR_PARTS = ("dht22", "load_cell", "feed_bin")
+    PART_ORDER = ("dht22", "load_cell", "feed_bin", "feed_servo",
+                  "water_refill", "heating_lamp", "exhaust_fan")
+    REASON_TEXT = {
+        "no_output": "no feed came out. Check for a jam.",
+        "error": "had an error. Check the servo.",
+        "stuck_open": "may be stuck open. Check it now.",
+        "no_fill": "not filling up. Check valve and float.",
+        "repeating": "keeps going low. Check for a leak.",
+        "no_heat": "is ON but not warming up. Check the bulb.",
+        "no_airflow": "is ON but air is not improving. Check it.",
     }
 
     def _problem_text(self, key, reason):
-        if key == "water_refill":
-            return "Drinker is not filling up. Check the water valve and float."
-        name = self.PART_NAMES[key]
-        if reason == "stuck":
-            return f"{name}: the reading has not changed for a long time. It may be stuck."
-        return f"{name}: not working. Please check its cable."
+        name = self.PART_NAMES.get(key, key)
+        if key in self.SENSOR_PARTS:
+            if reason == "stuck":
+                return f"{name}: reading is stuck. Please check it."
+            return f"{name}: not working. Check its cable."
+        return f"{name} {self.REASON_TEXT.get(reason, 'is not working. Please check it.')}"
 
     def _update_health(self, state, controller_ok):
         if not controller_ok:
@@ -426,7 +458,7 @@ class PoultryDashboard(tk.Tk):
         health = health if isinstance(health, dict) else {}
         reasons = state.get("sensor_fault_reason") or {}
         problems = [self._problem_text(k, reasons.get(k))
-                    for k in ("dht22", "load_cell", "feed_bin", "water_refill")
+                    for k in self.PART_ORDER
                     if health.get(k, True) is False]
 
         if problems:
@@ -580,7 +612,6 @@ class PoultryDashboard(tk.Tk):
         temp = state.get("temperature")
         hum = state.get("humidity")
         water = state.get("water_level")
-        tank = state.get("container_level")
         online = state.get("system_online", False)
         internet_online = state.get("internet_online", True)
         last_updated = state.get("last_updated", "")
@@ -629,7 +660,7 @@ class PoultryDashboard(tk.Tk):
 
         self.feed_capacity_grams = state.get("feed_capacity_grams", self.feed_capacity_grams)
 
-        # Feed level: use the percentage the Pi already computed.
+        # Feed level (plate): use the percentage the Pi already computed.
         feed_pct = state.get("feed_percent")
         is_low = state.get("feed_low_active", False)
         if feed_pct is not None:
@@ -641,12 +672,9 @@ class PoultryDashboard(tk.Tk):
             self.feed_value.config(text="-- %", fg=val_fg)
             self._set_badge(self.feed_badge, "--", "normal")
 
-        # Drinker card = ONE water indicator.
-        # Priority: tank empty (float sensor 2) > refilling > drinker low (float sensor 1) > normal
-        if tank == "empty":
-            self.water_value.config(text="Empty", fg=ACCENT_RED)
-            self._set_badge(self.water_badge, "Refill tank", "high")
-        elif is_watering:
+        # Drinker card (float sensor 1): refilling / low / normal.
+        # The water CONTAINER has its own card on the right.
+        if is_watering:
             self.water_value.config(text="Refilling", fg=ACCENT_BLUE)
             self._set_badge(self.water_badge, "Auto-refill", "info")
         elif water == "low":
@@ -659,13 +687,31 @@ class PoultryDashboard(tk.Tk):
             self.water_value.config(text="--", fg=val_fg)
             self._set_badge(self.water_badge, "--", "normal")
 
-        # Feed container (ultrasonic)
-        bin_pct = state.get("feed_bin_percent")
-        bin_low = state.get("feed_bin_low_active", False)
-        bin_state = state.get("feed_bin_state") or ("low" if bin_low else "ok")
+        # Containers: Full / Normal / Low / Empty (no percentages)
         health = state.get("sensor_health")
-        bin_ok = bool(health.get("feed_bin", True)) if isinstance(health, dict) else True
-        self._set_bin(bin_pct, bin_state, bin_ok, dim=data_stale)
+        health = health if isinstance(health, dict) else {}
+        bin_ok = bool(health.get("feed_bin", True))
+
+        bin_state = state.get("feed_bin_state") or ("low" if state.get("feed_bin_low_active") else "ok")
+        feed_label = state.get("feed_bin_label")
+        if not feed_label:
+            pct = state.get("feed_bin_percent")
+            if bin_state == "empty":
+                feed_label = "Empty"
+            elif bin_state == "low":
+                feed_label = "Low"
+            elif pct is None:
+                feed_label = "--"
+            else:
+                feed_label = "Full" if pct >= 80 else "Normal"
+        self._set_container(self.feed_bin_card, "feed", feed_label, sensor_ok=bin_ok, dim=data_stale)
+
+        water_bin_state = state.get("water_bin_state") or (
+            "low" if state.get("container_empty_active") else "ok")
+        water_label = state.get("water_bin_label") or ("Low" if water_bin_state == "low" else "Normal")
+        if state.get("container_level") is None and not state.get("water_bin_state"):
+            water_label = "--"
+        self._set_container(self.water_bin_card, "water", water_label, dim=data_stale)
 
         self._set_actuator_card(self.fan_card, self.fan_state_label, exhaust_fan_on)
         self._set_actuator_card(self.lamp_card, self.lamp_state_label, heating_lamp_on)
@@ -700,11 +746,13 @@ class PoultryDashboard(tk.Tk):
         elif is_watering:
             msg, color = "Refilling drinker...", ACCENT_BLUE
         elif state.get("water_refill_failed", False):
-            msg, color = "Water refill failed - check valve / float", ACCENT_RED
-        elif bin_state == "empty" and bin_ok:
+            msg, color = "Drinker is not filling - check valve / float", ACCENT_RED
+        elif feed_label == "Empty" and bin_ok:
             msg, color = "Feed container is EMPTY - please refill", ACCENT_RED
-        elif bin_state == "low" and bin_ok:
-            msg, color = "Feed container is low - please refill soon", ACCENT_RED
+        elif water_label == "Low":
+            msg, color = "Water container is low - please refill", ACCENT_RED
+        elif feed_label == "Low" and bin_ok:
+            msg, color = "Feed container is low - please refill soon", ACCENT_AMBER
         self.status_label.config(text=msg, fg=color)
 
 
