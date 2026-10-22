@@ -20,7 +20,7 @@ DEFAULT_HUM_MIN = 50
 DEFAULT_HUM_MAX = 70
 
 # HX711 Calibration
-HX711_OFFSET = 66206
+HX711_OFFSET = 66907
 HX711_SCALE = 412.65
 GRAMS_PER_SECOND = 15   # fallback dispense-rate estimate until dispense_rate_cache.json has real data
 
@@ -95,11 +95,11 @@ FEED_BIN_LOW_PERCENT = 20
 FEED_BIN_EMPTY_PERCENT = 5
 FEED_BIN_HYSTERESIS_PERCENT = 5
 FEED_BIN_FULL_PERCENT = 80        # at or above this the LCD / app says "Full", below it "Normal"
-FEED_BIN_LOW_CONFIRM_SECONDS = 600     # must read low/empty this long (straight) before it counts
+FEED_BIN_LOW_CONFIRM_SECONDS = 10     # must read low/empty this long (straight) before it counts
 FEED_BIN_REFILL_CONFIRM_SECONDS = 60   # must read OK this long before "refilled" is announced
 
 # ---- Water container (second float) ----
-WATER_BIN_LOW_CONFIRM_SECONDS = 600    # must read low this long (straight) before the alert / "Low" status
+WATER_BIN_LOW_CONFIRM_SECONDS = 10    # must read low this long (straight) before the alert / "Low" status
 WATER_BIN_REFILL_CONFIRM_SECONDS = 60  # must read OK this long before "refilled" is announced
 # (auto-refill still refuses to run the instant the container float reads empty - that protects the pump)
 

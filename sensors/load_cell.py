@@ -33,7 +33,11 @@ def setup_hx711(warmup_reads=5, warmup_delay=1.0):
 
     time.sleep(warmup_delay)
     for _ in range(warmup_reads):
-        _hx.get_raw_data_mean(readings=5)  # discarded - ADC settling
+        try:
+            _hx.get_raw_data_mean(readings=5)  # discarded - ADC settling
+        except Exception:
+            pass  # a bad warm-up read must not crash startup
+        time.sleep(0.2)
 
     return _hx
 
@@ -43,8 +47,11 @@ def read_raw(samples=10):
     if _hx is None:
         setup_hx711()
     with _hx_lock:   # the dispenser thread and main loop must never read the HX711 simultaneously
-        result = _hx.get_raw_data_mean(readings=samples)
-    if result is False:
+        try:
+            result = _hx.get_raw_data_mean(readings=samples)
+        except Exception:
+            return None   # bad read = "no reading", main.py already handles this
+    if result is False or result is None:
         return None
 
     last_raw_ok_time = time.time()
