@@ -2,10 +2,10 @@ import RPi.GPIO as GPIO
 import time
 
 FLOAT_SENSOR_PIN = 26        # trough float (auto-refill trigger)
-CONTAINER_SENSOR_PIN = 18    # container float (BCM 18 = physical pin 12)
+CONTAINER_SENSOR_PIN = 20    # container float (BCM 18 = physical pin 12)
 
 # Which pin state means the container is EMPTY. Flip to GPIO.HIGH if reversed.
-CONTAINER_EMPTY_STATE = GPIO.HIGH
+CONTAINER_EMPTY_STATE = GPIO.LOW
 
 # Pin state that means water is present at the trough.
 # With PUD_UP a normal float switch pulls the pin LOW when the float rises,

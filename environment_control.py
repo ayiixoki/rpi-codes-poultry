@@ -64,7 +64,7 @@ def main():
                 control_environment(temperature, humidity, thresholds)
             else:
                 print("Sensor read failed, retrying...")
-
+        
             time.sleep(config.SENSOR_READ_INTERVAL)
 
     except KeyboardInterrupt:

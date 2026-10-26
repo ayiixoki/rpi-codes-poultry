@@ -72,6 +72,7 @@ class CameraStreamer:
                 transform=Transform(hflip=HFLIP, vflip=VFLIP),
             )
             picam.configure(config)
+            picam.set_controls({"ScalerCrop": picam.camera_properties["ScalerCropMaximum"]})
             picam.start_recording(
                 MJPEGEncoder(), FileOutput(self._Output(self)), quality=QUALITY
             )

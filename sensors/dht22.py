@@ -15,3 +15,15 @@ def read_dht22():
 
 def cleanup():
     sensor.exit()
+
+
+if __name__ == "__main__":
+    try:
+        while True:
+            t, h = read_dht22()
+            print(f"Temp: {t}  Humidity: {h}")
+            time.sleep(2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cleanup()
